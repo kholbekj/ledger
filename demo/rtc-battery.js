@@ -439,13 +439,312 @@ var Storage = class {
   }
 };
 
+// src/signaling.ts
+var SignalingClient = class {
+  ws = null;
+  url;
+  token;
+  peerId;
+  reconnectAttempts = 0;
+  maxReconnectAttempts = 5;
+  reconnectDelay = 1e3;
+  handlers = /* @__PURE__ */ new Map();
+  constructor(url, token, peerId) {
+    this.url = url;
+    this.token = token;
+    this.peerId = peerId;
+  }
+  async connect() {
+    return new Promise((resolve, reject) => {
+      const wsUrl = `${this.url}?token=${encodeURIComponent(this.token)}`;
+      this.ws = new WebSocket(wsUrl);
+      this.ws.onopen = () => {
+        this.reconnectAttempts = 0;
+        this.send({ type: "join", peerId: this.peerId });
+        resolve();
+      };
+      this.ws.onerror = (err) => {
+        reject(new Error("WebSocket connection failed"));
+      };
+      this.ws.onclose = () => {
+        this.handleDisconnect();
+      };
+      this.ws.onmessage = (event) => {
+        try {
+          const msg = JSON.parse(event.data);
+          this.emit(msg.type, msg);
+        } catch (e) {
+          console.error("Failed to parse signaling message:", e);
+        }
+      };
+    });
+  }
+  handleDisconnect() {
+    if (this.reconnectAttempts < this.maxReconnectAttempts) {
+      this.reconnectAttempts++;
+      const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+      setTimeout(() => {
+        this.connect().catch(console.error);
+      }, delay);
+    }
+  }
+  send(message) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(message));
+    }
+  }
+  sendOffer(to, sdp) {
+    this.send({ type: "offer", to, sdp });
+  }
+  sendAnswer(to, sdp) {
+    this.send({ type: "answer", to, sdp });
+  }
+  sendIceCandidate(to, candidate) {
+    this.send({ type: "ice", to, candidate });
+  }
+  on(event, handler) {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, /* @__PURE__ */ new Set());
+    }
+    this.handlers.get(event).add(handler);
+    return () => this.handlers.get(event)?.delete(handler);
+  }
+  emit(event, data) {
+    this.handlers.get(event)?.forEach((handler) => {
+      try {
+        handler(data);
+      } catch (e) {
+        console.error("Signaling handler error:", e);
+      }
+    });
+  }
+  disconnect() {
+    this.maxReconnectAttempts = 0;
+    this.ws?.close();
+    this.ws = null;
+  }
+  isConnected() {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
+};
+
+// src/webrtc.ts
+var DEFAULT_ICE_SERVERS = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" }
+];
+var WebRTCManager = class {
+  signaling = null;
+  peers = /* @__PURE__ */ new Map();
+  iceServers;
+  localPeerId;
+  // Callbacks
+  onOperation = null;
+  onSyncRequest = null;
+  onPeerJoin = null;
+  onPeerLeave = null;
+  onPeerReady = null;
+  constructor(localPeerId, iceServers) {
+    this.localPeerId = localPeerId;
+    this.iceServers = iceServers || DEFAULT_ICE_SERVERS;
+  }
+  async connect(signalingUrl, token) {
+    this.signaling = new SignalingClient(signalingUrl, token, this.localPeerId);
+    this.signaling.on("peers", (event) => {
+      if (event.type === "peers") {
+        for (const peerId of event.peerIds) {
+          if (peerId !== this.localPeerId) {
+            this.createPeerConnection(peerId, true);
+          }
+        }
+      }
+    });
+    this.signaling.on("peer-join", (event) => {
+      if (event.type === "peer-join" && event.peerId !== this.localPeerId) {
+        this.onPeerJoin?.(event.peerId);
+      }
+    });
+    this.signaling.on("peer-leave", (event) => {
+      if (event.type === "peer-leave") {
+        this.removePeer(event.peerId);
+        this.onPeerLeave?.(event.peerId);
+      }
+    });
+    this.signaling.on("offer", async (event) => {
+      if (event.type === "offer") {
+        await this.handleOffer(event.from, event.sdp);
+      }
+    });
+    this.signaling.on("answer", async (event) => {
+      if (event.type === "answer") {
+        await this.handleAnswer(event.from, event.sdp);
+      }
+    });
+    this.signaling.on("ice", async (event) => {
+      if (event.type === "ice") {
+        await this.handleIceCandidate(event.from, event.candidate);
+      }
+    });
+    await this.signaling.connect();
+  }
+  async createPeerConnection(peerId, initiator) {
+    if (this.peers.has(peerId)) return;
+    const pc = new RTCPeerConnection({ iceServers: this.iceServers });
+    const peerConn = { pc, dc: null, ready: false };
+    this.peers.set(peerId, peerConn);
+    pc.onicecandidate = (event) => {
+      if (event.candidate) {
+        this.signaling?.sendIceCandidate(peerId, event.candidate.toJSON());
+      }
+    };
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === "failed" || pc.connectionState === "closed") {
+        this.removePeer(peerId);
+      }
+    };
+    if (initiator) {
+      const dc = pc.createDataChannel("rtc-battery", { ordered: true });
+      this.setupDataChannel(dc, peerId, peerConn);
+      peerConn.dc = dc;
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      this.signaling?.sendOffer(peerId, offer);
+    } else {
+      pc.ondatachannel = (event) => {
+        peerConn.dc = event.channel;
+        this.setupDataChannel(event.channel, peerId, peerConn);
+      };
+    }
+  }
+  setupDataChannel(dc, peerId, peerConn) {
+    dc.onopen = () => {
+      peerConn.ready = true;
+      this.onPeerReady?.(peerId);
+      this.sendToPeer(peerId, { type: "sync-request" });
+    };
+    dc.onclose = () => {
+      peerConn.ready = false;
+    };
+    dc.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data);
+        this.handleChannelMessage(msg, peerId);
+      } catch (e) {
+        console.error("Failed to parse channel message:", e);
+      }
+    };
+  }
+  handleChannelMessage(msg, fromPeerId) {
+    switch (msg.type) {
+      case "op":
+        this.onOperation?.(msg.payload, fromPeerId);
+        break;
+      case "sync-request":
+        const ops = this.onSyncRequest?.(fromPeerId, msg.fromVersion) || [];
+        this.sendToPeer(fromPeerId, { type: "sync-response", operations: ops });
+        break;
+      case "sync-response":
+        for (const op of msg.operations) {
+          this.onOperation?.(op, fromPeerId);
+        }
+        break;
+      case "ping":
+        this.sendToPeer(fromPeerId, { type: "pong" });
+        break;
+      case "pong":
+        break;
+    }
+  }
+  async handleOffer(from, sdp) {
+    await this.createPeerConnection(from, false);
+    const peer = this.peers.get(from);
+    if (!peer) return;
+    await peer.pc.setRemoteDescription(sdp);
+    const answer = await peer.pc.createAnswer();
+    await peer.pc.setLocalDescription(answer);
+    this.signaling?.sendAnswer(from, answer);
+  }
+  async handleAnswer(from, sdp) {
+    const peer = this.peers.get(from);
+    if (!peer) return;
+    await peer.pc.setRemoteDescription(sdp);
+  }
+  async handleIceCandidate(from, candidate) {
+    const peer = this.peers.get(from);
+    if (!peer) return;
+    await peer.pc.addIceCandidate(candidate);
+  }
+  removePeer(peerId) {
+    const peer = this.peers.get(peerId);
+    if (peer) {
+      peer.dc?.close();
+      peer.pc.close();
+      this.peers.delete(peerId);
+    }
+  }
+  /**
+   * Send message to a specific peer
+   */
+  sendToPeer(peerId, message) {
+    const peer = this.peers.get(peerId);
+    if (peer?.dc?.readyState === "open") {
+      peer.dc.send(JSON.stringify(message));
+      return true;
+    }
+    return false;
+  }
+  /**
+   * Broadcast operation to all connected peers
+   */
+  broadcast(op) {
+    const message = { type: "op", payload: op };
+    for (const [peerId, peer] of this.peers) {
+      if (peer.dc?.readyState === "open") {
+        peer.dc.send(JSON.stringify(message));
+      }
+    }
+  }
+  /**
+   * Request sync from all peers
+   */
+  requestSync(fromVersion) {
+    const message = { type: "sync-request", fromVersion };
+    for (const [peerId, peer] of this.peers) {
+      if (peer.dc?.readyState === "open") {
+        peer.dc.send(JSON.stringify(message));
+      }
+    }
+  }
+  /**
+   * Get list of connected peer IDs
+   */
+  getConnectedPeers() {
+    return Array.from(this.peers.entries()).filter(([_, peer]) => peer.ready).map(([id]) => id);
+  }
+  /**
+   * Disconnect from all peers and signaling
+   */
+  disconnect() {
+    for (const [peerId] of this.peers) {
+      this.removePeer(peerId);
+    }
+    this.signaling?.disconnect();
+    this.signaling = null;
+  }
+  isConnected() {
+    return this.signaling?.isConnected() ?? false;
+  }
+};
+
 // src/index.ts
 var RTCBattery = class {
   config;
   sql;
   storage;
   clock;
+  webrtc = null;
   initialized = false;
+  connected = false;
   saveTimeout = null;
   eventListeners = /* @__PURE__ */ new Map();
   constructor(config = {}) {
@@ -458,7 +757,7 @@ var RTCBattery = class {
     this.clock = new HybridClock();
   }
   /**
-   * Initialize the database
+   * Initialize the database (local only)
    */
   async init() {
     if (this.initialized) return;
@@ -466,11 +765,62 @@ var RTCBattery = class {
     const existingData = await this.storage.loadDatabase();
     await this.sql.init(existingData || void 0);
     this.initialized = true;
+    await this.updateOperationsCache();
     this.scheduleSave();
   }
   /**
+   * Connect to signaling server and start P2P sync
+   */
+  async connect(signalingUrl, token) {
+    this.ensureInitialized();
+    const url = signalingUrl || this.config.signalingUrl;
+    const roomToken = token || this.config.token;
+    if (!url) {
+      throw new Error("Signaling URL required. Provide in config or connect() call.");
+    }
+    if (!roomToken) {
+      throw new Error("Token required. Provide in config or connect() call.");
+    }
+    this.webrtc = new WebRTCManager(this.clock.getNodeId(), this.config.iceServers);
+    this.webrtc.onOperation = async (op, fromPeerId) => {
+      await this.applyRemoteOperation(op);
+      this.emit("operation", op, fromPeerId);
+    };
+    this.webrtc.onSyncRequest = (fromPeerId, fromVersion) => {
+      return this.getCachedOperations(fromVersion);
+    };
+    this.webrtc.onPeerJoin = (peerId) => {
+      this.emit("peer-join", peerId);
+    };
+    this.webrtc.onPeerLeave = (peerId) => {
+      this.emit("peer-leave", peerId);
+    };
+    this.webrtc.onPeerReady = (peerId) => {
+      this.emit("peer-ready", peerId);
+    };
+    await this.webrtc.connect(url, roomToken);
+    this.connected = true;
+    this.emit("connected");
+  }
+  // Cache for sync responses (sync callback can't be async)
+  operationsCache = [];
+  operationsCacheVersion;
+  getCachedOperations(fromVersion) {
+    if (fromVersion && fromVersion === this.operationsCacheVersion) {
+      return [];
+    }
+    return this.operationsCache;
+  }
+  async updateOperationsCache() {
+    this.operationsCache = await this.storage.getOperations();
+    if (this.operationsCache.length > 0) {
+      const lastOp = this.operationsCache[this.operationsCache.length - 1];
+      this.operationsCacheVersion = HybridClock.toString(lastOp.hlc);
+    }
+  }
+  /**
    * Execute SQL query
-   * Mutations are automatically tracked as operations
+   * Mutations are automatically tracked as operations and synced to peers
    */
   async exec(sql, params) {
     this.ensureInitialized();
@@ -480,14 +830,18 @@ var RTCBattery = class {
     for (const op of operations) {
       await this.storage.saveOperation(op);
       this.emit("operation", op);
+      if (this.webrtc) {
+        this.webrtc.broadcast(op);
+      }
     }
     if (operations.length > 0) {
+      await this.updateOperationsCache();
       this.scheduleSave();
     }
     return result;
   }
   /**
-   * Execute SQL without CRDT tracking (local only)
+   * Execute SQL without CRDT tracking (local only, not synced)
    */
   async execLocal(sql, params) {
     this.ensureInitialized();
@@ -502,6 +856,7 @@ var RTCBattery = class {
     this.clock.receive(op.hlc);
     this.sql.applyOperation(op);
     await this.storage.saveOperation(op);
+    await this.updateOperationsCache();
     this.scheduleSave();
   }
   /**
@@ -538,6 +893,18 @@ var RTCBattery = class {
     return this.clock.getNodeId();
   }
   /**
+   * Get connected peer IDs
+   */
+  getPeers() {
+    return this.webrtc?.getConnectedPeers() || [];
+  }
+  /**
+   * Check if connected to signaling server
+   */
+  isConnected() {
+    return this.connected && (this.webrtc?.isConnected() ?? false);
+  }
+  /**
    * Event subscription
    */
   on(event, callback) {
@@ -559,9 +926,19 @@ var RTCBattery = class {
     });
   }
   /**
-   * Close and cleanup
+   * Disconnect from peers and signaling
+   */
+  disconnect() {
+    this.webrtc?.disconnect();
+    this.webrtc = null;
+    this.connected = false;
+    this.emit("disconnected");
+  }
+  /**
+   * Close and cleanup everything
    */
   async close() {
+    this.disconnect();
     if (this.saveTimeout) {
       clearTimeout(this.saveTimeout);
       await this.saveDatabase();

@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RTC Battery Demo</title>
-    <style>
+  <style>
     * { box-sizing: border-box; }
     body {
       font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
@@ -15,6 +15,12 @@
       color: #eee;
     }
     h1 { color: #00d4ff; margin-bottom: 5px; }
+    header {
+      display: flex;
+      align-items: center;
+      gap: 15px;
+      flex-wrap: wrap;
+    }
     .status {
       display: inline-block;
       padding: 4px 12px;
@@ -23,7 +29,14 @@
       background: #2d2d44;
     }
     .status.connected { background: #1b4332; color: #95d5b2; }
+    .status.syncing { background: #3d3d1f; color: #f4f4a4; }
     .status.disconnected { background: #3d1f1f; color: #f4a4a4; }
+    .peers {
+      margin-left: auto;
+      font-size: 14px;
+      color: #888;
+    }
+    .peers strong { color: #00d4ff; }
     .share-url {
       background: #2d2d44;
       padding: 12px;
@@ -48,6 +61,37 @@
       border-radius: 4px;
       cursor: pointer;
       font-weight: bold;
+    }
+    .connect-bar {
+      background: #2d2d44;
+      padding: 12px;
+      border-radius: 8px;
+      margin: 15px 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .connect-bar input {
+      flex: 1;
+      background: #1a1a2e;
+      border: 1px solid #3d3d5c;
+      color: #fff;
+      padding: 8px 12px;
+      border-radius: 4px;
+      font-size: 14px;
+      outline: none;
+    }
+    .connect-bar button {
+      background: #00d4ff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .connect-bar button:disabled {
+      background: #3d3d5c;
+      cursor: not-allowed;
     }
     .editor {
       background: #0d0d1a;
@@ -110,6 +154,7 @@
     .log-entry.info { color: #00d4ff; }
     .log-entry.success { color: #95d5b2; }
     .log-entry.error { color: #f4a4a4; }
+    .log-entry.sync { color: #f4f4a4; }
     .error-msg {
       background: #3d1f1f;
       color: #f4a4a4;
@@ -123,6 +168,7 @@
   <header>
     <h1>RTC Battery Demo</h1>
     <span id="status" class="status disconnected">Initializing...</span>
+    <div class="peers">Peers: <strong id="peer-count">0</strong></div>
   </header>
 
   <div class="share-url">
@@ -131,10 +177,16 @@
     <button onclick="copyUrl()">Copy</button>
   </div>
 
+  <div class="connect-bar">
+    <input type="text" id="signaling-url" placeholder="ws://localhost:8081" value="ws://localhost:8081">
+    <button id="connect-btn" onclick="toggleConnect()">Connect</button>
+  </div>
+
   <div class="editor">
     <textarea id="sql" placeholder="Enter SQL query...">SELECT * FROM notes;</textarea>
     <br><br>
     <button class="run" onclick="runQuery()">Run Query</button>
+    <button class="run" onclick="insertSample()" style="margin-left: 10px; background: #6c5ce7;">+ Add Note</button>
   </div>
 
   <div class="results">
@@ -158,26 +210,79 @@
     };
 
     window.db = null;
+    window.token = null;
+    window.isConnected = false;
+
+    function updateStatus(text, className) {
+      const el = document.getElementById('status');
+      el.textContent = text;
+      el.className = 'status ' + className;
+    }
+
+    function updatePeerCount() {
+      const count = window.db?.getPeers().length || 0;
+      document.getElementById('peer-count').textContent = count;
+    }
 
     async function init() {
       log('Initializing RTCBattery...', 'info');
 
       // Get or create token from URL hash
-      let token = window.location.hash.slice(1);
-      if (!token) {
-        token = crypto.randomUUID().split('-')[0];
-        window.location.hash = token;
+      window.token = window.location.hash.slice(1);
+      if (!window.token) {
+        window.token = crypto.randomUUID().split('-')[0];
+        window.location.hash = window.token;
       }
 
       document.getElementById('share-url').value = window.location.href;
 
       try {
         window.db = new RTCBattery({
-          dbName: `rtc-battery-${token}`
+          dbName: `rtc-battery-${window.token}`,
+          token: window.token
+        });
+
+        // Set up event listeners
+        window.db.on('peer-join', (peerId) => {
+          log(`Peer discovered: ${peerId.slice(0, 8)}...`, 'info');
+        });
+
+        window.db.on('peer-ready', (peerId) => {
+          log(`Peer connected: ${peerId.slice(0, 8)}...`, 'success');
+          updatePeerCount();
+        });
+
+        window.db.on('peer-leave', (peerId) => {
+          log(`Peer left: ${peerId.slice(0, 8)}...`, 'info');
+          updatePeerCount();
+        });
+
+        window.db.on('operation', (op, fromPeerId) => {
+          if (fromPeerId) {
+            log(`Sync: ${op.type} on ${op.table} from ${fromPeerId.slice(0, 8)}...`, 'sync');
+            // Refresh display
+            runQuery();
+          }
+        });
+
+        window.db.on('connected', () => {
+          log('Connected to signaling server', 'success');
+          updateStatus('Connected', 'connected');
+          document.getElementById('connect-btn').textContent = 'Disconnect';
+          window.isConnected = true;
+        });
+
+        window.db.on('disconnected', () => {
+          log('Disconnected from signaling', 'info');
+          updateStatus('Local Only', 'syncing');
+          document.getElementById('connect-btn').textContent = 'Connect';
+          window.isConnected = false;
+          updatePeerCount();
         });
 
         await window.db.init();
         log('Database initialized', 'success');
+        log(`Node ID: ${window.db.getNodeId().slice(0, 8)}...`, 'info');
 
         // Create sample table if not exists
         await window.db.exec(`
@@ -189,17 +294,38 @@
         `);
         log('Schema ready', 'success');
 
-        document.getElementById('status').textContent = 'Local DB Ready';
-        document.getElementById('status').className = 'status connected';
+        updateStatus('Local Only', 'syncing');
 
         // Run initial query
         await runQuery();
 
       } catch (err) {
         log('Init error: ' + err.message, 'error');
-        document.getElementById('status').textContent = 'Error';
+        updateStatus('Error', 'disconnected');
       }
     }
+
+    window.toggleConnect = async function() {
+      if (window.isConnected) {
+        window.db.disconnect();
+      } else {
+        const url = document.getElementById('signaling-url').value.trim();
+        if (!url) {
+          log('Please enter signaling server URL', 'error');
+          return;
+        }
+        try {
+          document.getElementById('connect-btn').disabled = true;
+          document.getElementById('connect-btn').textContent = 'Connecting...';
+          await window.db.connect(url, window.token);
+        } catch (err) {
+          log('Connection error: ' + err.message, 'error');
+          document.getElementById('connect-btn').disabled = false;
+          document.getElementById('connect-btn').textContent = 'Connect';
+        }
+      }
+      document.getElementById('connect-btn').disabled = false;
+    };
 
     window.runQuery = async function() {
       const sql = document.getElementById('sql').value.trim();
@@ -215,6 +341,21 @@
         document.getElementById('results').innerHTML =
           `<div class="error-msg">${err.message}</div>`;
         log('Query error: ' + err.message, 'error');
+      }
+    };
+
+    window.insertSample = async function() {
+      const id = crypto.randomUUID();
+      const content = `Note ${Date.now()}`;
+      try {
+        await window.db.exec(
+          `INSERT INTO notes (id, content) VALUES (?, ?)`,
+          [id, content]
+        );
+        log(`Inserted note: ${content}`, 'success');
+        await runQuery();
+      } catch (err) {
+        log('Insert error: ' + err.message, 'error');
       }
     };
 

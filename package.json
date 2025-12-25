@@ -9,11 +9,13 @@
     "build": "esbuild src/index.ts --bundle --outfile=dist/rtc-battery.js --format=esm --external:sql.js",
     "build:demo": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser",
     "dev": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser --watch --servedir=demo",
+    "signal": "node server/signaling.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "sql.js": "^1.11.0"
+    "sql.js": "^1.11.0",
+    "ws": "^8.18.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
