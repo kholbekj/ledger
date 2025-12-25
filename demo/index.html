@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RTC Battery Demo</title>
+    <style>
+    * { box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #1a1a2e;
+      color: #eee;
+    }
+    h1 { color: #00d4ff; margin-bottom: 5px; }
+    .status {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 20px;
+      font-size: 14px;
+      background: #2d2d44;
+    }
+    .status.connected { background: #1b4332; color: #95d5b2; }
+    .status.disconnected { background: #3d1f1f; color: #f4a4a4; }
+    .share-url {
+      background: #2d2d44;
+      padding: 12px;
+      border-radius: 8px;
+      margin: 15px 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .share-url input {
+      flex: 1;
+      background: transparent;
+      border: none;
+      color: #00d4ff;
+      font-size: 14px;
+      outline: none;
+    }
+    .share-url button {
+      background: #00d4ff;
+      border: none;
+      padding: 8px 16px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+    .editor {
+      background: #0d0d1a;
+      border: 1px solid #3d3d5c;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+    }
+    textarea {
+      width: 100%;
+      height: 100px;
+      background: transparent;
+      border: none;
+      color: #fff;
+      font-family: 'Monaco', 'Menlo', monospace;
+      font-size: 14px;
+      resize: vertical;
+      outline: none;
+    }
+    button.run {
+      background: #00d4ff;
+      border: none;
+      padding: 10px 24px;
+      border-radius: 4px;
+      cursor: pointer;
+      font-weight: bold;
+      font-size: 14px;
+    }
+    button.run:hover { background: #00b8e6; }
+    .results {
+      background: #0d0d1a;
+      border: 1px solid #3d3d5c;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px 12px;
+      border-bottom: 1px solid #3d3d5c;
+    }
+    th { color: #00d4ff; }
+    .log {
+      background: #0d0d1a;
+      border: 1px solid #3d3d5c;
+      border-radius: 8px;
+      padding: 15px;
+      margin: 15px 0;
+      max-height: 200px;
+      overflow-y: auto;
+      font-family: monospace;
+      font-size: 13px;
+    }
+    .log-entry { padding: 4px 0; color: #888; }
+    .log-entry.info { color: #00d4ff; }
+    .log-entry.success { color: #95d5b2; }
+    .log-entry.error { color: #f4a4a4; }
+    .error-msg {
+      background: #3d1f1f;
+      color: #f4a4a4;
+      padding: 12px;
+      border-radius: 8px;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>RTC Battery Demo</h1>
+    <span id="status" class="status disconnected">Initializing...</span>
+  </header>
+
+  <div class="share-url">
+    <span>Share URL:</span>
+    <input type="text" id="share-url" readonly>
+    <button onclick="copyUrl()">Copy</button>
+  </div>
+
+  <div class="editor">
+    <textarea id="sql" placeholder="Enter SQL query...">SELECT * FROM notes;</textarea>
+    <br><br>
+    <button class="run" onclick="runQuery()">Run Query</button>
+  </div>
+
+  <div class="results">
+    <h3>Results</h3>
+    <div id="results">No results yet</div>
+  </div>
+
+  <div class="log">
+    <div id="log"></div>
+  </div>
+
+  <script type="module">
+    import { RTCBattery } from './rtc-battery.js';
+
+    window.log = function(msg, type = '') {
+      const logEl = document.getElementById('log');
+      const entry = document.createElement('div');
+      entry.className = 'log-entry ' + type;
+      entry.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+      logEl.insertBefore(entry, logEl.firstChild);
+    };
+
+    window.db = null;
+
+    async function init() {
+      log('Initializing RTCBattery...', 'info');
+
+      // Get or create token from URL hash
+      let token = window.location.hash.slice(1);
+      if (!token) {
+        token = crypto.randomUUID().split('-')[0];
+        window.location.hash = token;
+      }
+
+      document.getElementById('share-url').value = window.location.href;
+
+      try {
+        window.db = new RTCBattery({
+          dbName: `rtc-battery-${token}`
+        });
+
+        await window.db.init();
+        log('Database initialized', 'success');
+
+        // Create sample table if not exists
+        await window.db.exec(`
+          CREATE TABLE IF NOT EXISTS notes (
+            id TEXT PRIMARY KEY,
+            content TEXT,
+            created_at TEXT DEFAULT (datetime('now'))
+          )
+        `);
+        log('Schema ready', 'success');
+
+        document.getElementById('status').textContent = 'Local DB Ready';
+        document.getElementById('status').className = 'status connected';
+
+        // Run initial query
+        await runQuery();
+
+      } catch (err) {
+        log('Init error: ' + err.message, 'error');
+        document.getElementById('status').textContent = 'Error';
+      }
+    }
+
+    window.runQuery = async function() {
+      const sql = document.getElementById('sql').value.trim();
+      if (!sql || !window.db) return;
+
+      log(`Executing: ${sql.substring(0, 50)}...`);
+
+      try {
+        const result = await window.db.exec(sql);
+        displayResults(result);
+        log(`Query returned ${result.rows?.length || 0} rows`, 'success');
+      } catch (err) {
+        document.getElementById('results').innerHTML =
+          `<div class="error-msg">${err.message}</div>`;
+        log('Query error: ' + err.message, 'error');
+      }
+    };
+
+    function displayResults(result) {
+      const container = document.getElementById('results');
+
+      if (!result.columns || result.columns.length === 0) {
+        container.innerHTML = '<em>Query executed successfully (no results)</em>';
+        return;
+      }
+
+      let html = '<table><thead><tr>';
+      for (const col of result.columns) {
+        html += `<th>${col}</th>`;
+      }
+      html += '</tr></thead><tbody>';
+
+      for (const row of result.rows || []) {
+        html += '<tr>';
+        for (const val of row) {
+          html += `<td>${val ?? '<null>'}</td>`;
+        }
+        html += '</tr>';
+      }
+      html += '</tbody></table>';
+
+      if ((result.rows || []).length === 0) {
+        html += '<em>No rows</em>';
+      }
+
+      container.innerHTML = html;
+    }
+
+    window.copyUrl = function() {
+      navigator.clipboard.writeText(window.location.href);
+      log('URL copied to clipboard', 'info');
+    };
+
+    init();
+  </script>
+</body>
+</html>

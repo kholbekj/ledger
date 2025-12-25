@@ -1,0 +1,220 @@
+import { HybridClock, HLC } from './hlc';
+import { SQLLayer } from './sql';
+import { Storage } from './storage';
+import type { Operation, QueryResult, RTCBatteryConfig } from './types';
+
+export type { Operation, QueryResult, RTCBatteryConfig, HLC };
+export { HybridClock };
+
+type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'error' | 'operation';
+type EventCallback = (...args: unknown[]) => void;
+
+/**
+ * RTCBattery - WebRTC + SQL + CRDT Replication
+ *
+ * Phase 1: Local SQL with IndexedDB persistence and operation tracking
+ */
+export class RTCBattery {
+  private config: RTCBatteryConfig;
+  private sql: SQLLayer;
+  private storage: Storage;
+  private clock: HybridClock;
+  private initialized = false;
+  private saveTimeout: ReturnType<typeof setTimeout> | null = null;
+  private eventListeners: Map<EventType, Set<EventCallback>> = new Map();
+
+  constructor(config: RTCBatteryConfig = {}) {
+    this.config = {
+      dbName: 'rtc-battery-default',
+      ...config
+    };
+    this.sql = new SQLLayer();
+    this.storage = new Storage(this.config.dbName!);
+    this.clock = new HybridClock();
+  }
+
+  /**
+   * Initialize the database
+   */
+  async init(): Promise<void> {
+    if (this.initialized) return;
+
+    // Open IndexedDB
+    await this.storage.open();
+
+    // Try to load existing database
+    const existingData = await this.storage.loadDatabase();
+    await this.sql.init(existingData || undefined);
+
+    this.initialized = true;
+
+    // Auto-save periodically
+    this.scheduleSave();
+  }
+
+  /**
+   * Execute SQL query
+   * Mutations are automatically tracked as operations
+   */
+  async exec(sql: string, params?: unknown[]): Promise<QueryResult> {
+    this.ensureInitialized();
+
+    const isMutation = this.isMutation(sql);
+    const hlc = isMutation ? this.clock.now() : undefined;
+
+    const { result, operations } = this.sql.execute(sql, params, hlc);
+
+    // Save operations
+    for (const op of operations) {
+      await this.storage.saveOperation(op);
+      this.emit('operation', op);
+    }
+
+    // Schedule database save if there were mutations
+    if (operations.length > 0) {
+      this.scheduleSave();
+    }
+
+    return result;
+  }
+
+  /**
+   * Execute SQL without CRDT tracking (local only)
+   */
+  async execLocal(sql: string, params?: unknown[]): Promise<QueryResult> {
+    this.ensureInitialized();
+    const { result } = this.sql.execute(sql, params);
+    return result;
+  }
+
+  /**
+   * Apply a remote operation (from another peer)
+   */
+  async applyRemoteOperation(op: Operation): Promise<void> {
+    this.ensureInitialized();
+
+    // Update our clock based on remote timestamp
+    this.clock.receive(op.hlc);
+
+    // Apply to database
+    this.sql.applyOperation(op);
+
+    // Save operation to log
+    await this.storage.saveOperation(op);
+
+    // Schedule save
+    this.scheduleSave();
+  }
+
+  /**
+   * Get all operations after a given HLC (for sync)
+   */
+  async getOperationsAfter(afterHlc?: string): Promise<Operation[]> {
+    return this.storage.getOperations(afterHlc);
+  }
+
+  /**
+   * Get current operation count
+   */
+  async getOperationCount(): Promise<number> {
+    return this.storage.getOperationCount();
+  }
+
+  /**
+   * Export database as binary
+   */
+  exportDatabase(): Uint8Array {
+    this.ensureInitialized();
+    return this.sql.export();
+  }
+
+  /**
+   * Import database from binary
+   */
+  importDatabase(data: Uint8Array): void {
+    this.ensureInitialized();
+    this.sql.import(data);
+    this.scheduleSave();
+  }
+
+  /**
+   * Get local node ID
+   */
+  getNodeId(): string {
+    return this.clock.getNodeId();
+  }
+
+  /**
+   * Event subscription
+   */
+  on(event: EventType, callback: EventCallback): () => void {
+    if (!this.eventListeners.has(event)) {
+      this.eventListeners.set(event, new Set());
+    }
+    this.eventListeners.get(event)!.add(callback);
+
+    // Return unsubscribe function
+    return () => {
+      this.eventListeners.get(event)?.delete(callback);
+    };
+  }
+
+  private emit(event: EventType, ...args: unknown[]): void {
+    this.eventListeners.get(event)?.forEach(cb => {
+      try {
+        cb(...args);
+      } catch (e) {
+        console.error('Event listener error:', e);
+      }
+    });
+  }
+
+  /**
+   * Close and cleanup
+   */
+  async close(): Promise<void> {
+    if (this.saveTimeout) {
+      clearTimeout(this.saveTimeout);
+      await this.saveDatabase();
+    }
+    this.sql.close();
+    this.storage.close();
+    this.initialized = false;
+  }
+
+  // Private helpers
+
+  private ensureInitialized(): void {
+    if (!this.initialized) {
+      throw new Error('RTCBattery not initialized. Call init() first.');
+    }
+  }
+
+  private isMutation(sql: string): boolean {
+    const normalized = sql.trim().toUpperCase();
+    return (
+      normalized.startsWith('INSERT') ||
+      normalized.startsWith('UPDATE') ||
+      normalized.startsWith('DELETE')
+    );
+  }
+
+  private scheduleSave(): void {
+    if (this.saveTimeout) return;
+
+    this.saveTimeout = setTimeout(async () => {
+      this.saveTimeout = null;
+      await this.saveDatabase();
+    }, 1000); // Debounce saves to 1 second
+  }
+
+  private async saveDatabase(): Promise<void> {
+    try {
+      const data = this.sql.export();
+      await this.storage.saveDatabase(data);
+    } catch (e) {
+      console.error('Failed to save database:', e);
+      this.emit('error', e);
+    }
+  }
+}

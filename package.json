@@ -1,0 +1,23 @@
+{
+  "name": "rtc-battery",
+  "version": "0.1.0",
+  "description": "WebRTC + SQL + CRDT replication library",
+  "type": "module",
+  "main": "dist/rtc-battery.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --outfile=dist/rtc-battery.js --format=esm --external:sql.js",
+    "build:demo": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser",
+    "dev": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser --watch --servedir=demo",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "sql.js": "^1.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.7.0"
+  }
+}
