@@ -446,26 +446,49 @@ var SignalingClient = class {
   token;
   peerId;
   reconnectAttempts = 0;
-  maxReconnectAttempts = 5;
-  reconnectDelay = 1e3;
+  maxReconnectAttempts = 10;
+  baseDelay = 1e3;
+  maxDelay = 3e4;
   handlers = /* @__PURE__ */ new Map();
+  shouldReconnect = true;
+  isInitialConnect = true;
   constructor(url, token, peerId) {
     this.url = url;
     this.token = token;
     this.peerId = peerId;
   }
   async connect() {
+    this.shouldReconnect = true;
     return new Promise((resolve, reject) => {
       const wsUrl = `${this.url}?token=${encodeURIComponent(this.token)}`;
-      this.ws = new WebSocket(wsUrl);
-      this.ws.onopen = () => {
+      try {
+        this.ws = new WebSocket(wsUrl);
+      } catch (e) {
+        reject(new Error("WebSocket connection failed"));
+        return;
+      }
+      const onOpen = () => {
+        cleanup();
         this.reconnectAttempts = 0;
+        if (!this.isInitialConnect) {
+          this.emit("reconnected", { type: "reconnected" });
+        }
+        this.isInitialConnect = false;
         this.send({ type: "join", peerId: this.peerId });
         resolve();
       };
-      this.ws.onerror = (err) => {
-        reject(new Error("WebSocket connection failed"));
+      const onError = () => {
+        cleanup();
+        if (this.isInitialConnect) {
+          reject(new Error("WebSocket connection failed"));
+        }
       };
+      const cleanup = () => {
+        this.ws?.removeEventListener("open", onOpen);
+        this.ws?.removeEventListener("error", onError);
+      };
+      this.ws.addEventListener("open", onOpen);
+      this.ws.addEventListener("error", onError);
       this.ws.onclose = () => {
         this.handleDisconnect();
       };
@@ -480,12 +503,28 @@ var SignalingClient = class {
     });
   }
   handleDisconnect() {
+    if (!this.shouldReconnect) {
+      this.emit("disconnected", { type: "disconnected" });
+      return;
+    }
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+      const delay = Math.min(
+        this.baseDelay * Math.pow(2, this.reconnectAttempts - 1),
+        this.maxDelay
+      );
+      this.emit("reconnecting", {
+        type: "reconnecting",
+        attempt: this.reconnectAttempts
+      });
       setTimeout(() => {
-        this.connect().catch(console.error);
+        if (this.shouldReconnect) {
+          this.connect().catch(() => {
+          });
+        }
       }, delay);
+    } else {
+      this.emit("disconnected", { type: "disconnected" });
     }
   }
   send(message) {
@@ -519,7 +558,7 @@ var SignalingClient = class {
     });
   }
   disconnect() {
-    this.maxReconnectAttempts = 0;
+    this.shouldReconnect = false;
     this.ws?.close();
     this.ws = null;
   }
@@ -538,17 +577,25 @@ var WebRTCManager = class {
   peers = /* @__PURE__ */ new Map();
   iceServers;
   localPeerId;
+  signalingUrl = "";
+  token = "";
   // Callbacks
   onOperation = null;
   onSyncRequest = null;
   onPeerJoin = null;
   onPeerLeave = null;
   onPeerReady = null;
+  onReconnecting = null;
+  onReconnected = null;
+  onDisconnected = null;
+  getLocalVersion = null;
   constructor(localPeerId, iceServers) {
     this.localPeerId = localPeerId;
     this.iceServers = iceServers || DEFAULT_ICE_SERVERS;
   }
   async connect(signalingUrl, token) {
+    this.signalingUrl = signalingUrl;
+    this.token = token;
     this.signaling = new SignalingClient(signalingUrl, token, this.localPeerId);
     this.signaling.on("peers", (event) => {
       if (event.type === "peers") {
@@ -585,6 +632,17 @@ var WebRTCManager = class {
         await this.handleIceCandidate(event.from, event.candidate);
       }
     });
+    this.signaling.on("reconnecting", (event) => {
+      if (event.type === "reconnecting") {
+        this.onReconnecting?.(event.attempt);
+      }
+    });
+    this.signaling.on("reconnected", () => {
+      this.onReconnected?.();
+    });
+    this.signaling.on("disconnected", () => {
+      this.onDisconnected?.();
+    });
     await this.signaling.connect();
   }
   async createPeerConnection(peerId, initiator) {
@@ -600,6 +658,7 @@ var WebRTCManager = class {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === "failed" || pc.connectionState === "closed") {
         this.removePeer(peerId);
+        this.onPeerLeave?.(peerId);
       }
     };
     if (initiator) {
@@ -620,7 +679,8 @@ var WebRTCManager = class {
     dc.onopen = () => {
       peerConn.ready = true;
       this.onPeerReady?.(peerId);
-      this.sendToPeer(peerId, { type: "sync-request" });
+      const localVersion = this.getLocalVersion?.();
+      this.sendToPeer(peerId, { type: "sync-request", fromVersion: peerConn.lastSyncedVersion });
     };
     dc.onclose = () => {
       peerConn.ready = false;
@@ -628,24 +688,31 @@ var WebRTCManager = class {
     dc.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
-        this.handleChannelMessage(msg, peerId);
+        this.handleChannelMessage(msg, peerId, peerConn);
       } catch (e) {
         console.error("Failed to parse channel message:", e);
       }
     };
   }
-  handleChannelMessage(msg, fromPeerId) {
+  handleChannelMessage(msg, fromPeerId, peerConn) {
     switch (msg.type) {
       case "op":
         this.onOperation?.(msg.payload, fromPeerId);
+        if (msg.version) {
+          peerConn.lastSyncedVersion = msg.version;
+        }
         break;
       case "sync-request":
         const ops = this.onSyncRequest?.(fromPeerId, msg.fromVersion) || [];
-        this.sendToPeer(fromPeerId, { type: "sync-response", operations: ops });
+        const version = this.getLocalVersion?.();
+        this.sendToPeer(fromPeerId, { type: "sync-response", operations: ops, version });
         break;
       case "sync-response":
         for (const op of msg.operations) {
           this.onOperation?.(op, fromPeerId);
+        }
+        if (msg.version) {
+          peerConn.lastSyncedVersion = msg.version;
         }
         break;
       case "ping":
@@ -682,9 +749,6 @@ var WebRTCManager = class {
       this.peers.delete(peerId);
     }
   }
-  /**
-   * Send message to a specific peer
-   */
   sendToPeer(peerId, message) {
     const peer = this.peers.get(peerId);
     if (peer?.dc?.readyState === "open") {
@@ -694,13 +758,15 @@ var WebRTCManager = class {
     return false;
   }
   /**
-   * Broadcast operation to all connected peers
+   * Broadcast operation to all connected peers with version info
    */
   broadcast(op) {
-    const message = { type: "op", payload: op };
+    const version = HybridClock.toString(op.hlc);
+    const message = { type: "op", payload: op, version };
     for (const [peerId, peer] of this.peers) {
       if (peer.dc?.readyState === "open") {
         peer.dc.send(JSON.stringify(message));
+        peer.lastSyncedVersion = version;
       }
     }
   }
@@ -715,15 +781,9 @@ var WebRTCManager = class {
       }
     }
   }
-  /**
-   * Get list of connected peer IDs
-   */
   getConnectedPeers() {
     return Array.from(this.peers.entries()).filter(([_, peer]) => peer.ready).map(([id]) => id);
   }
-  /**
-   * Disconnect from all peers and signaling
-   */
   disconnect() {
     for (const [peerId] of this.peers) {
       this.removePeer(peerId);
@@ -747,6 +807,9 @@ var RTCBattery = class {
   connected = false;
   saveTimeout = null;
   eventListeners = /* @__PURE__ */ new Map();
+  // Cache for sync responses (sync callback can't be async)
+  operationsCache = [];
+  operationsCacheVersion;
   constructor(config = {}) {
     this.config = {
       dbName: "rtc-battery-default",
@@ -789,6 +852,9 @@ var RTCBattery = class {
     this.webrtc.onSyncRequest = (fromPeerId, fromVersion) => {
       return this.getCachedOperations(fromVersion);
     };
+    this.webrtc.getLocalVersion = () => {
+      return this.operationsCacheVersion;
+    };
     this.webrtc.onPeerJoin = (peerId) => {
       this.emit("peer-join", peerId);
     };
@@ -798,24 +864,39 @@ var RTCBattery = class {
     this.webrtc.onPeerReady = (peerId) => {
       this.emit("peer-ready", peerId);
     };
+    this.webrtc.onReconnecting = (attempt) => {
+      this.emit("reconnecting", attempt);
+    };
+    this.webrtc.onReconnected = () => {
+      this.emit("reconnected");
+    };
+    this.webrtc.onDisconnected = () => {
+      this.connected = false;
+      this.emit("disconnected");
+    };
     await this.webrtc.connect(url, roomToken);
     this.connected = true;
     this.emit("connected");
   }
-  // Cache for sync responses (sync callback can't be async)
-  operationsCache = [];
-  operationsCacheVersion;
   getCachedOperations(fromVersion) {
-    if (fromVersion && fromVersion === this.operationsCacheVersion) {
-      return [];
+    if (!fromVersion) {
+      return this.operationsCache;
     }
-    return this.operationsCache;
+    const index = this.operationsCache.findIndex((op) => {
+      return HybridClock.toString(op.hlc) === fromVersion;
+    });
+    if (index === -1) {
+      return this.operationsCache;
+    }
+    return this.operationsCache.slice(index + 1);
   }
   async updateOperationsCache() {
     this.operationsCache = await this.storage.getOperations();
     if (this.operationsCache.length > 0) {
       const lastOp = this.operationsCache[this.operationsCache.length - 1];
       this.operationsCacheVersion = HybridClock.toString(lastOp.hlc);
+    } else {
+      this.operationsCacheVersion = void 0;
     }
   }
   /**
@@ -870,6 +951,12 @@ var RTCBattery = class {
    */
   async getOperationCount() {
     return this.storage.getOperationCount();
+  }
+  /**
+   * Get current version (HLC string of last operation)
+   */
+  getVersion() {
+    return this.operationsCacheVersion;
   }
   /**
    * Export database as binary
@@ -947,7 +1034,6 @@ var RTCBattery = class {
     this.storage.close();
     this.initialized = false;
   }
-  // Private helpers
   ensureInitialized() {
     if (!this.initialized) {
       throw new Error("RTCBattery not initialized. Call init() first.");

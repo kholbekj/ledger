@@ -7,7 +7,7 @@ import type { Operation, QueryResult, RTCBatteryConfig } from './types';
 export type { Operation, QueryResult, RTCBatteryConfig, HLC };
 export { HybridClock };
 
-type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'peer-ready' | 'error' | 'operation' | 'connected' | 'disconnected';
+type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'peer-ready' | 'error' | 'operation' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected';
 type EventCallback = (...args: unknown[]) => void;
 
 /**
@@ -23,6 +23,10 @@ export class RTCBattery {
   private connected = false;
   private saveTimeout: ReturnType<typeof setTimeout> | null = null;
   private eventListeners: Map<EventType, Set<EventCallback>> = new Map();
+
+  // Cache for sync responses (sync callback can't be async)
+  private operationsCache: Operation[] = [];
+  private operationsCacheVersion: string | undefined;
 
   constructor(config: RTCBatteryConfig = {}) {
     this.config = {
@@ -40,10 +44,8 @@ export class RTCBattery {
   async init(): Promise<void> {
     if (this.initialized) return;
 
-    // Open IndexedDB
     await this.storage.open();
 
-    // Try to load existing database
     const existingData = await this.storage.loadDatabase();
     await this.sql.init(existingData || undefined);
 
@@ -52,7 +54,6 @@ export class RTCBattery {
     // Load operations cache for sync
     await this.updateOperationsCache();
 
-    // Auto-save periodically
     this.scheduleSave();
   }
 
@@ -72,21 +73,25 @@ export class RTCBattery {
       throw new Error('Token required. Provide in config or connect() call.');
     }
 
-    // Create WebRTC manager
     this.webrtc = new WebRTCManager(this.clock.getNodeId(), this.config.iceServers);
 
-    // Set up WebRTC callbacks
+    // Operation handler
     this.webrtc.onOperation = async (op, fromPeerId) => {
       await this.applyRemoteOperation(op);
       this.emit('operation', op, fromPeerId);
     };
 
+    // Sync request handler - returns operations newer than fromVersion
     this.webrtc.onSyncRequest = (fromPeerId, fromVersion) => {
-      // Return all operations (or from version if specified)
-      // This is sync so we need to be careful - return cached ops
       return this.getCachedOperations(fromVersion);
     };
 
+    // Provide local version for sync protocol
+    this.webrtc.getLocalVersion = () => {
+      return this.operationsCacheVersion;
+    };
+
+    // Peer events
     this.webrtc.onPeerJoin = (peerId) => {
       this.emit('peer-join', peerId);
     };
@@ -99,23 +104,42 @@ export class RTCBattery {
       this.emit('peer-ready', peerId);
     };
 
-    // Connect to signaling server
+    // Reconnection events
+    this.webrtc.onReconnecting = (attempt) => {
+      this.emit('reconnecting', attempt);
+    };
+
+    this.webrtc.onReconnected = () => {
+      this.emit('reconnected');
+    };
+
+    this.webrtc.onDisconnected = () => {
+      this.connected = false;
+      this.emit('disconnected');
+    };
+
     await this.webrtc.connect(url, roomToken);
     this.connected = true;
     this.emit('connected');
   }
 
-  // Cache for sync responses (sync callback can't be async)
-  private operationsCache: Operation[] = [];
-  private operationsCacheVersion: string | undefined;
-
   private getCachedOperations(fromVersion?: string): Operation[] {
-    // Return cached operations
-    // The cache is updated after each mutation
-    if (fromVersion && fromVersion === this.operationsCacheVersion) {
-      return [];
+    if (!fromVersion) {
+      return this.operationsCache;
     }
-    return this.operationsCache;
+
+    // Return only operations newer than fromVersion (delta sync)
+    const index = this.operationsCache.findIndex(op => {
+      return HybridClock.toString(op.hlc) === fromVersion;
+    });
+
+    if (index === -1) {
+      // Version not found, send all
+      return this.operationsCache;
+    }
+
+    // Return operations after the found version
+    return this.operationsCache.slice(index + 1);
   }
 
   private async updateOperationsCache(): Promise<void> {
@@ -123,6 +147,8 @@ export class RTCBattery {
     if (this.operationsCache.length > 0) {
       const lastOp = this.operationsCache[this.operationsCache.length - 1];
       this.operationsCacheVersion = HybridClock.toString(lastOp.hlc);
+    } else {
+      this.operationsCacheVersion = undefined;
     }
   }
 
@@ -138,18 +164,15 @@ export class RTCBattery {
 
     const { result, operations } = this.sql.execute(sql, params, hlc);
 
-    // Save and broadcast operations
     for (const op of operations) {
       await this.storage.saveOperation(op);
       this.emit('operation', op);
 
-      // Broadcast to peers
       if (this.webrtc) {
         this.webrtc.broadcast(op);
       }
     }
 
-    // Update cache and schedule save
     if (operations.length > 0) {
       await this.updateOperationsCache();
       this.scheduleSave();
@@ -173,16 +196,9 @@ export class RTCBattery {
   async applyRemoteOperation(op: Operation): Promise<void> {
     this.ensureInitialized();
 
-    // Update our clock based on remote timestamp
     this.clock.receive(op.hlc);
-
-    // Apply to database
     this.sql.applyOperation(op);
-
-    // Save operation to log
     await this.storage.saveOperation(op);
-
-    // Update cache and schedule save
     await this.updateOperationsCache();
     this.scheduleSave();
   }
@@ -199,6 +215,13 @@ export class RTCBattery {
    */
   async getOperationCount(): Promise<number> {
     return this.storage.getOperationCount();
+  }
+
+  /**
+   * Get current version (HLC string of last operation)
+   */
+  getVersion(): string | undefined {
+    return this.operationsCacheVersion;
   }
 
   /**
@@ -248,7 +271,6 @@ export class RTCBattery {
     }
     this.eventListeners.get(event)!.add(callback);
 
-    // Return unsubscribe function
     return () => {
       this.eventListeners.get(event)?.delete(callback);
     };
@@ -289,8 +311,6 @@ export class RTCBattery {
     this.initialized = false;
   }
 
-  // Private helpers
-
   private ensureInitialized(): void {
     if (!this.initialized) {
       throw new Error('RTCBattery not initialized. Call init() first.');
@@ -312,7 +332,7 @@ export class RTCBattery {
     this.saveTimeout = setTimeout(async () => {
       this.saveTimeout = null;
       await this.saveDatabase();
-    }, 1000); // Debounce saves to 1 second
+    }, 1000);
   }
 
   private async saveDatabase(): Promise<void> {

@@ -6,9 +6,9 @@ import { HybridClock } from './hlc';
  * DataChannel message types
  */
 export type ChannelMessage =
-  | { type: 'op'; payload: Operation }
+  | { type: 'op'; payload: Operation; version: string }
   | { type: 'sync-request'; fromVersion?: string }
-  | { type: 'sync-response'; operations: Operation[] }
+  | { type: 'sync-response'; operations: Operation[]; version?: string }
   | { type: 'ping' }
   | { type: 'pong' };
 
@@ -16,6 +16,7 @@ interface PeerConnection {
   pc: RTCPeerConnection;
   dc: RTCDataChannel | null;
   ready: boolean;
+  lastSyncedVersion?: string;
 }
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
@@ -31,6 +32,8 @@ export class WebRTCManager {
   private peers: Map<string, PeerConnection> = new Map();
   private iceServers: RTCIceServer[];
   private localPeerId: string;
+  private signalingUrl: string = '';
+  private token: string = '';
 
   // Callbacks
   onOperation: ((op: Operation, fromPeerId: string) => void) | null = null;
@@ -38,6 +41,10 @@ export class WebRTCManager {
   onPeerJoin: ((peerId: string) => void) | null = null;
   onPeerLeave: ((peerId: string) => void) | null = null;
   onPeerReady: ((peerId: string) => void) | null = null;
+  onReconnecting: ((attempt: number) => void) | null = null;
+  onReconnected: (() => void) | null = null;
+  onDisconnected: (() => void) | null = null;
+  getLocalVersion: (() => string | undefined) | null = null;
 
   constructor(localPeerId: string, iceServers?: RTCIceServer[]) {
     this.localPeerId = localPeerId;
@@ -45,12 +52,13 @@ export class WebRTCManager {
   }
 
   async connect(signalingUrl: string, token: string): Promise<void> {
+    this.signalingUrl = signalingUrl;
+    this.token = token;
     this.signaling = new SignalingClient(signalingUrl, token, this.localPeerId);
 
     // Set up signaling handlers
     this.signaling.on('peers', (event) => {
       if (event.type === 'peers') {
-        // Connect to existing peers
         for (const peerId of event.peerIds) {
           if (peerId !== this.localPeerId) {
             this.createPeerConnection(peerId, true);
@@ -62,7 +70,6 @@ export class WebRTCManager {
     this.signaling.on('peer-join', (event) => {
       if (event.type === 'peer-join' && event.peerId !== this.localPeerId) {
         this.onPeerJoin?.(event.peerId);
-        // New peer will initiate connection to us
       }
     });
 
@@ -91,6 +98,20 @@ export class WebRTCManager {
       }
     });
 
+    this.signaling.on('reconnecting', (event) => {
+      if (event.type === 'reconnecting') {
+        this.onReconnecting?.(event.attempt);
+      }
+    });
+
+    this.signaling.on('reconnected', () => {
+      this.onReconnected?.();
+    });
+
+    this.signaling.on('disconnected', () => {
+      this.onDisconnected?.();
+    });
+
     await this.signaling.connect();
   }
 
@@ -101,7 +122,6 @@ export class WebRTCManager {
     const peerConn: PeerConnection = { pc, dc: null, ready: false };
     this.peers.set(peerId, peerConn);
 
-    // ICE candidate handling
     pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.signaling?.sendIceCandidate(peerId, event.candidate.toJSON());
@@ -111,21 +131,19 @@ export class WebRTCManager {
     pc.onconnectionstatechange = () => {
       if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
         this.removePeer(peerId);
+        this.onPeerLeave?.(peerId);
       }
     };
 
     if (initiator) {
-      // Create data channel
       const dc = pc.createDataChannel('rtc-battery', { ordered: true });
       this.setupDataChannel(dc, peerId, peerConn);
       peerConn.dc = dc;
 
-      // Create and send offer
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this.signaling?.sendOffer(peerId, offer);
     } else {
-      // Wait for data channel from remote
       pc.ondatachannel = (event) => {
         peerConn.dc = event.channel;
         this.setupDataChannel(event.channel, peerId, peerConn);
@@ -138,8 +156,9 @@ export class WebRTCManager {
       peerConn.ready = true;
       this.onPeerReady?.(peerId);
 
-      // Request sync from this peer
-      this.sendToPeer(peerId, { type: 'sync-request' });
+      // Request sync from this peer, sending our version for delta sync
+      const localVersion = this.getLocalVersion?.();
+      this.sendToPeer(peerId, { type: 'sync-request', fromVersion: peerConn.lastSyncedVersion });
     };
 
     dc.onclose = () => {
@@ -149,27 +168,36 @@ export class WebRTCManager {
     dc.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data) as ChannelMessage;
-        this.handleChannelMessage(msg, peerId);
+        this.handleChannelMessage(msg, peerId, peerConn);
       } catch (e) {
         console.error('Failed to parse channel message:', e);
       }
     };
   }
 
-  private handleChannelMessage(msg: ChannelMessage, fromPeerId: string): void {
+  private handleChannelMessage(msg: ChannelMessage, fromPeerId: string, peerConn: PeerConnection): void {
     switch (msg.type) {
       case 'op':
         this.onOperation?.(msg.payload, fromPeerId);
+        // Update last synced version for this peer
+        if (msg.version) {
+          peerConn.lastSyncedVersion = msg.version;
+        }
         break;
 
       case 'sync-request':
         const ops = this.onSyncRequest?.(fromPeerId, msg.fromVersion) || [];
-        this.sendToPeer(fromPeerId, { type: 'sync-response', operations: ops });
+        const version = this.getLocalVersion?.();
+        this.sendToPeer(fromPeerId, { type: 'sync-response', operations: ops, version });
         break;
 
       case 'sync-response':
         for (const op of msg.operations) {
           this.onOperation?.(op, fromPeerId);
+        }
+        // Update last synced version
+        if (msg.version) {
+          peerConn.lastSyncedVersion = msg.version;
         }
         break;
 
@@ -178,7 +206,6 @@ export class WebRTCManager {
         break;
 
       case 'pong':
-        // Peer is alive
         break;
     }
   }
@@ -215,9 +242,6 @@ export class WebRTCManager {
     }
   }
 
-  /**
-   * Send message to a specific peer
-   */
   sendToPeer(peerId: string, message: ChannelMessage): boolean {
     const peer = this.peers.get(peerId);
     if (peer?.dc?.readyState === 'open') {
@@ -228,13 +252,15 @@ export class WebRTCManager {
   }
 
   /**
-   * Broadcast operation to all connected peers
+   * Broadcast operation to all connected peers with version info
    */
   broadcast(op: Operation): void {
-    const message: ChannelMessage = { type: 'op', payload: op };
+    const version = HybridClock.toString(op.hlc);
+    const message: ChannelMessage = { type: 'op', payload: op, version };
     for (const [peerId, peer] of this.peers) {
       if (peer.dc?.readyState === 'open') {
         peer.dc.send(JSON.stringify(message));
+        peer.lastSyncedVersion = version;
       }
     }
   }
@@ -251,18 +277,12 @@ export class WebRTCManager {
     }
   }
 
-  /**
-   * Get list of connected peer IDs
-   */
   getConnectedPeers(): string[] {
     return Array.from(this.peers.entries())
       .filter(([_, peer]) => peer.ready)
       .map(([id]) => id);
   }
 
-  /**
-   * Disconnect from all peers and signaling
-   */
   disconnect(): void {
     for (const [peerId] of this.peers) {
       this.removePeer(peerId);

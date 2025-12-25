@@ -280,6 +280,16 @@
           updatePeerCount();
         });
 
+        window.db.on('reconnecting', (attempt) => {
+          log(`Reconnecting... attempt ${attempt}`, 'info');
+          updateStatus(`Reconnecting (${attempt})`, 'syncing');
+        });
+
+        window.db.on('reconnected', () => {
+          log('Reconnected to signaling server', 'success');
+          updateStatus('Connected', 'connected');
+        });
+
         await window.db.init();
         log('Database initialized', 'success');
         log(`Node ID: ${window.db.getNodeId().slice(0, 8)}...`, 'info');

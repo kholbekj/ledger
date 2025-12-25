@@ -14,7 +14,10 @@ export type SignalingEvent =
   | { type: 'peer-leave'; peerId: string }
   | { type: 'offer'; from: string; sdp: RTCSessionDescriptionInit }
   | { type: 'answer'; from: string; sdp: RTCSessionDescriptionInit }
-  | { type: 'ice'; from: string; candidate: RTCIceCandidateInit };
+  | { type: 'ice'; from: string; candidate: RTCIceCandidateInit }
+  | { type: 'reconnecting'; attempt: number }
+  | { type: 'reconnected' }
+  | { type: 'disconnected' };
 
 export class SignalingClient {
   private ws: WebSocket | null = null;
@@ -22,9 +25,12 @@ export class SignalingClient {
   private token: string;
   private peerId: string;
   private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private reconnectDelay = 1000;
+  private maxReconnectAttempts = 10;
+  private baseDelay = 1000;
+  private maxDelay = 30000;
   private handlers: Map<string, Set<(event: SignalingEvent) => void>> = new Map();
+  private shouldReconnect = true;
+  private isInitialConnect = true;
 
   constructor(url: string, token: string, peerId: string) {
     this.url = url;
@@ -33,19 +39,45 @@ export class SignalingClient {
   }
 
   async connect(): Promise<void> {
+    this.shouldReconnect = true;
+
     return new Promise((resolve, reject) => {
       const wsUrl = `${this.url}?token=${encodeURIComponent(this.token)}`;
-      this.ws = new WebSocket(wsUrl);
 
-      this.ws.onopen = () => {
+      try {
+        this.ws = new WebSocket(wsUrl);
+      } catch (e) {
+        reject(new Error('WebSocket connection failed'));
+        return;
+      }
+
+      const onOpen = () => {
+        cleanup();
         this.reconnectAttempts = 0;
+
+        if (!this.isInitialConnect) {
+          this.emit('reconnected', { type: 'reconnected' });
+        }
+        this.isInitialConnect = false;
+
         this.send({ type: 'join', peerId: this.peerId });
         resolve();
       };
 
-      this.ws.onerror = (err) => {
-        reject(new Error('WebSocket connection failed'));
+      const onError = () => {
+        cleanup();
+        if (this.isInitialConnect) {
+          reject(new Error('WebSocket connection failed'));
+        }
       };
+
+      const cleanup = () => {
+        this.ws?.removeEventListener('open', onOpen);
+        this.ws?.removeEventListener('error', onError);
+      };
+
+      this.ws.addEventListener('open', onOpen);
+      this.ws.addEventListener('error', onError);
 
       this.ws.onclose = () => {
         this.handleDisconnect();
@@ -63,12 +95,32 @@ export class SignalingClient {
   }
 
   private handleDisconnect(): void {
+    if (!this.shouldReconnect) {
+      this.emit('disconnected', { type: 'disconnected' });
+      return;
+    }
+
     if (this.reconnectAttempts < this.maxReconnectAttempts) {
       this.reconnectAttempts++;
-      const delay = this.reconnectDelay * Math.pow(2, this.reconnectAttempts - 1);
+      const delay = Math.min(
+        this.baseDelay * Math.pow(2, this.reconnectAttempts - 1),
+        this.maxDelay
+      );
+
+      this.emit('reconnecting', {
+        type: 'reconnecting',
+        attempt: this.reconnectAttempts
+      });
+
       setTimeout(() => {
-        this.connect().catch(console.error);
+        if (this.shouldReconnect) {
+          this.connect().catch(() => {
+            // Will trigger another reconnect attempt via onclose
+          });
+        }
       }, delay);
+    } else {
+      this.emit('disconnected', { type: 'disconnected' });
     }
   }
 
@@ -109,7 +161,7 @@ export class SignalingClient {
   }
 
   disconnect(): void {
-    this.maxReconnectAttempts = 0; // Prevent reconnection
+    this.shouldReconnect = false;
     this.ws?.close();
     this.ws = null;
   }
