@@ -1,5 +1,5 @@
 {
-  "name": "ledger",
+  "name": "@drifting-ink/ledger",
   "version": "0.2.0",
   "description": "WebRTC + SQL + CRDT replication library (powered by cr-sqlite)",
   "type": "module",

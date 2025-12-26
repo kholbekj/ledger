@@ -5,13 +5,13 @@ WebRTC + SQLite + CRDT replication. Peer-to-peer syncing SQL database for the br
 ## Install
 
 ```bash
-npm install ledger
+npm install @drifting-ink/ledger
 ```
 
 ## Usage
 
 ```javascript
-import { Ledger } from 'ledger';
+import { Ledger } from '@drifting-ink/ledger';
 
 // Create instance
 const db = new Ledger({ dbName: 'my-app' });
