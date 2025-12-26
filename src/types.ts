@@ -1,20 +1,6 @@
-import type { HLC } from './hlc';
-
-export type OperationType = 'INSERT' | 'UPDATE' | 'DELETE';
-
-export interface Operation {
-  hlc: HLC;
-  type: OperationType;
-  table: string;
-  pk: Record<string, unknown>;
-  values?: Record<string, unknown>;
-}
-
 export interface QueryResult {
   columns: string[];
   rows: unknown[][];
-  changes?: number;
-  lastInsertRowId?: number;
 }
 
 export interface RTCBatteryConfig {
@@ -24,6 +10,5 @@ export interface RTCBatteryConfig {
   dbName?: string;
 }
 
-export interface StoredOperation extends Operation {
-  id: string; // HLC string for indexing
-}
+// Re-export CRChange from crsqlite for sync
+export type { CRChange } from './crsqlite';

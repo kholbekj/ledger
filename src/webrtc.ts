@@ -1,14 +1,13 @@
 import { SignalingClient } from './signaling';
-import type { Operation } from './types';
-import { HybridClock } from './hlc';
+import type { CRChange } from './crsqlite';
 
 /**
- * DataChannel message types
+ * DataChannel message types for cr-sqlite sync
  */
 export type ChannelMessage =
-  | { type: 'op'; payload: Operation; version: string }
-  | { type: 'sync-request'; fromVersion?: string }
-  | { type: 'sync-response'; operations: Operation[]; version?: string }
+  | { type: 'sync-request'; version: number }
+  | { type: 'sync-response'; changes: CRChange[]; version: number }
+  | { type: 'changes'; changes: CRChange[]; version: number }
   | { type: 'ping' }
   | { type: 'pong' };
 
@@ -16,7 +15,7 @@ interface PeerConnection {
   pc: RTCPeerConnection;
   dc: RTCDataChannel | null;
   ready: boolean;
-  lastSyncedVersion?: string;
+  lastSyncedVersion: number;
 }
 
 const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
@@ -25,26 +24,24 @@ const DEFAULT_ICE_SERVERS: RTCIceServer[] = [
 ];
 
 /**
- * WebRTC Manager for P2P connections
+ * WebRTC Manager for P2P connections with cr-sqlite sync
  */
 export class WebRTCManager {
   private signaling: SignalingClient | null = null;
   private peers: Map<string, PeerConnection> = new Map();
   private iceServers: RTCIceServer[];
   private localPeerId: string;
-  private signalingUrl: string = '';
-  private token: string = '';
 
   // Callbacks
-  onOperation: ((op: Operation, fromPeerId: string) => void) | null = null;
-  onSyncRequest: ((fromPeerId: string, fromVersion?: string) => Operation[]) | null = null;
+  onSyncRequest: ((fromPeerId: string, sinceVersion: number) => Promise<{ changes: CRChange[]; version: number }>) | null = null;
+  onChangesReceived: ((changes: CRChange[], fromPeerId: string) => Promise<void>) | null = null;
   onPeerJoin: ((peerId: string) => void) | null = null;
   onPeerLeave: ((peerId: string) => void) | null = null;
   onPeerReady: ((peerId: string) => void) | null = null;
   onReconnecting: ((attempt: number) => void) | null = null;
   onReconnected: (() => void) | null = null;
   onDisconnected: (() => void) | null = null;
-  getLocalVersion: (() => string | undefined) | null = null;
+  getLocalVersion: (() => number) | null = null;
 
   constructor(localPeerId: string, iceServers?: RTCIceServer[]) {
     this.localPeerId = localPeerId;
@@ -52,11 +49,8 @@ export class WebRTCManager {
   }
 
   async connect(signalingUrl: string, token: string): Promise<void> {
-    this.signalingUrl = signalingUrl;
-    this.token = token;
     this.signaling = new SignalingClient(signalingUrl, token, this.localPeerId);
 
-    // Set up signaling handlers
     this.signaling.on('peers', (event) => {
       if (event.type === 'peers') {
         for (const peerId of event.peerIds) {
@@ -119,7 +113,7 @@ export class WebRTCManager {
     if (this.peers.has(peerId)) return;
 
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const peerConn: PeerConnection = { pc, dc: null, ready: false };
+    const peerConn: PeerConnection = { pc, dc: null, ready: false, lastSyncedVersion: 0 };
     this.peers.set(peerId, peerConn);
 
     pc.onicecandidate = (event) => {
@@ -156,9 +150,9 @@ export class WebRTCManager {
       peerConn.ready = true;
       this.onPeerReady?.(peerId);
 
-      // Request sync from this peer, sending our version for delta sync
-      const localVersion = this.getLocalVersion?.();
-      this.sendToPeer(peerId, { type: 'sync-request', fromVersion: peerConn.lastSyncedVersion });
+      // Request sync from this peer
+      const localVersion = this.getLocalVersion?.() ?? 0;
+      this.sendToPeer(peerId, { type: 'sync-request', version: localVersion });
     };
 
     dc.onclose = () => {
@@ -175,31 +169,38 @@ export class WebRTCManager {
     };
   }
 
-  private handleChannelMessage(msg: ChannelMessage, fromPeerId: string, peerConn: PeerConnection): void {
+  private async handleChannelMessage(msg: ChannelMessage, fromPeerId: string, peerConn: PeerConnection): Promise<void> {
     switch (msg.type) {
-      case 'op':
-        this.onOperation?.(msg.payload, fromPeerId);
-        // Update last synced version for this peer
-        if (msg.version) {
-          peerConn.lastSyncedVersion = msg.version;
+      case 'sync-request': {
+        // Peer wants changes since their version
+        const result = await this.onSyncRequest?.(fromPeerId, msg.version);
+        if (result) {
+          this.sendToPeer(fromPeerId, {
+            type: 'sync-response',
+            changes: result.changes,
+            version: result.version
+          });
         }
         break;
+      }
 
-      case 'sync-request':
-        const ops = this.onSyncRequest?.(fromPeerId, msg.fromVersion) || [];
-        const version = this.getLocalVersion?.();
-        this.sendToPeer(fromPeerId, { type: 'sync-response', operations: ops, version });
+      case 'sync-response': {
+        // Apply changes from peer
+        if (msg.changes.length > 0) {
+          await this.onChangesReceived?.(msg.changes, fromPeerId);
+        }
+        peerConn.lastSyncedVersion = msg.version;
         break;
+      }
 
-      case 'sync-response':
-        for (const op of msg.operations) {
-          this.onOperation?.(op, fromPeerId);
+      case 'changes': {
+        // Real-time changes broadcast
+        if (msg.changes.length > 0) {
+          await this.onChangesReceived?.(msg.changes, fromPeerId);
         }
-        // Update last synced version
-        if (msg.version) {
-          peerConn.lastSyncedVersion = msg.version;
-        }
+        peerConn.lastSyncedVersion = msg.version;
         break;
+      }
 
       case 'ping':
         this.sendToPeer(fromPeerId, { type: 'pong' });
@@ -252,27 +253,14 @@ export class WebRTCManager {
   }
 
   /**
-   * Broadcast operation to all connected peers with version info
+   * Broadcast changes to all connected peers
    */
-  broadcast(op: Operation): void {
-    const version = HybridClock.toString(op.hlc);
-    const message: ChannelMessage = { type: 'op', payload: op, version };
+  broadcastChanges(changes: CRChange[], version: number): void {
+    const message: ChannelMessage = { type: 'changes', changes, version };
     for (const [peerId, peer] of this.peers) {
       if (peer.dc?.readyState === 'open') {
         peer.dc.send(JSON.stringify(message));
         peer.lastSyncedVersion = version;
-      }
-    }
-  }
-
-  /**
-   * Request sync from all peers
-   */
-  requestSync(fromVersion?: string): void {
-    const message: ChannelMessage = { type: 'sync-request', fromVersion };
-    for (const [peerId, peer] of this.peers) {
-      if (peer.dc?.readyState === 'open') {
-        peer.dc.send(JSON.stringify(message));
       }
     }
   }

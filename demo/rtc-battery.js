@@ -1,441 +1,159 @@
-// src/hlc.ts
-var HybridClock = class {
-  ts = 0;
-  counter = 0;
-  nodeId;
-  constructor(nodeId) {
-    this.nodeId = nodeId || crypto.randomUUID();
+// src/crsqlite.ts
+function uint8ToBase64(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) {
+    binary += String.fromCharCode(bytes[i]);
   }
-  getNodeId() {
-    return this.nodeId;
-  }
-  /**
-   * Generate a new timestamp for a local event
-   */
-  now() {
-    const physicalNow = Date.now();
-    if (physicalNow > this.ts) {
-      this.ts = physicalNow;
-      this.counter = 0;
-    } else {
-      this.counter++;
-    }
-    return {
-      ts: this.ts,
-      counter: this.counter,
-      nodeId: this.nodeId
-    };
-  }
-  /**
-   * Update local clock based on received remote timestamp
-   * Returns a new timestamp that is guaranteed to be greater than both local and remote
-   */
-  receive(remote) {
-    const physicalNow = Date.now();
-    const maxTs = Math.max(this.ts, remote.ts, physicalNow);
-    if (maxTs === this.ts && maxTs === remote.ts) {
-      this.counter = Math.max(this.counter, remote.counter) + 1;
-    } else if (maxTs === this.ts) {
-      this.counter++;
-    } else if (maxTs === remote.ts) {
-      this.ts = remote.ts;
-      this.counter = remote.counter + 1;
-    } else {
-      this.ts = physicalNow;
-      this.counter = 0;
-    }
-    this.ts = maxTs;
-    return {
-      ts: this.ts,
-      counter: this.counter,
-      nodeId: this.nodeId
-    };
-  }
-  /**
-   * Compare two HLCs
-   * Returns: -1 if a < b, 0 if a == b, 1 if a > b
-   */
-  static compare(a, b) {
-    if (a.ts !== b.ts) {
-      return a.ts < b.ts ? -1 : 1;
-    }
-    if (a.counter !== b.counter) {
-      return a.counter < b.counter ? -1 : 1;
-    }
-    if (a.nodeId !== b.nodeId) {
-      return a.nodeId < b.nodeId ? -1 : 1;
-    }
-    return 0;
-  }
-  /**
-   * Convert HLC to a sortable string representation
-   */
-  static toString(hlc) {
-    const ts = hlc.ts.toString(36).padStart(11, "0");
-    const counter = hlc.counter.toString(36).padStart(5, "0");
-    return `${ts}-${counter}-${hlc.nodeId}`;
-  }
-  /**
-   * Parse HLC from string representation
-   */
-  static fromString(str) {
-    const parts = str.split("-");
-    if (parts.length < 3) {
-      throw new Error("Invalid HLC string");
-    }
-    return {
-      ts: parseInt(parts[0], 36),
-      counter: parseInt(parts[1], 36),
-      nodeId: parts.slice(2).join("-")
-    };
-  }
-};
-
-// src/sql.ts
-var SQL = null;
-async function loadSqlJs() {
-  if (SQL) return SQL;
-  if (typeof initSqlJs !== "undefined") {
-    SQL = await initSqlJs({
-      locateFile: (file) => `https://sql.js.org/dist/${file}`
-    });
-    return SQL;
-  }
-  await new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://sql.js.org/dist/sql-wasm.js";
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error("Failed to load sql.js"));
-    document.head.appendChild(script);
-  });
-  SQL = await initSqlJs({
-    locateFile: (file) => `https://sql.js.org/dist/${file}`
-  });
-  return SQL;
+  return btoa(binary);
 }
-var SQLLayer = class {
+function base64ToUint8(base64) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+var sqliteInstance = null;
+async function loadCrSqlite() {
+  if (sqliteInstance) return sqliteInstance;
+  const initWasm = (await import("@vlcn.io/crsqlite-wasm")).default;
+  sqliteInstance = await initWasm();
+  return sqliteInstance;
+}
+var CRSQLiteDB = class {
   db = null;
-  tableSchemas = /* @__PURE__ */ new Map();
-  async init(data) {
-    const sqlJs = await loadSqlJs();
-    this.db = data ? new sqlJs.Database(data) : new sqlJs.Database();
-    this.db.run("PRAGMA foreign_keys = ON");
-  }
-  getDb() {
-    if (!this.db) throw new Error("Database not initialized");
-    return this.db;
-  }
-  /**
-   * Execute SQL and extract operations for mutations
-   */
-  execute(sql, params, hlc) {
-    const db = this.getDb();
-    const operations = [];
-    const normalizedSql = sql.trim().toUpperCase();
-    if (normalizedSql.startsWith("INSERT") && hlc) {
-      const op = this.captureInsert(sql, params || [], hlc);
-      if (op) operations.push(op);
-    } else if (normalizedSql.startsWith("UPDATE") && hlc) {
-      const ops = this.captureUpdate(sql, params || [], hlc);
-      operations.push(...ops);
-    } else if (normalizedSql.startsWith("DELETE") && hlc) {
-      const ops = this.captureDelete(sql, params || [], hlc);
-      operations.push(...ops);
-    }
-    const stmt = db.prepare(sql);
-    if (params) {
-      stmt.bind(params);
-    }
-    const columns = stmt.getColumnNames();
-    const rows = [];
-    while (stmt.step()) {
-      rows.push(stmt.get());
-    }
-    stmt.free();
-    if (normalizedSql.startsWith("CREATE") || normalizedSql.startsWith("ALTER")) {
-      this.refreshSchemas();
-    }
-    return {
-      result: {
-        columns,
-        rows,
-        changes: db.getRowsModified()
-      },
-      operations
-    };
-  }
-  /**
-   * Apply a remote operation to the database
-   */
-  applyOperation(op) {
-    const db = this.getDb();
-    switch (op.type) {
-      case "INSERT": {
-        const cols = Object.keys(op.values || {});
-        const placeholders = cols.map(() => "?").join(", ");
-        const sql = `INSERT OR REPLACE INTO ${op.table} (${cols.join(", ")}) VALUES (${placeholders})`;
-        db.run(sql, Object.values(op.values || {}));
-        break;
-      }
-      case "UPDATE": {
-        const sets = Object.keys(op.values || {}).map((col) => `${col} = ?`).join(", ");
-        const wheres = Object.keys(op.pk).map((col) => `${col} = ?`).join(" AND ");
-        const sql = `UPDATE ${op.table} SET ${sets} WHERE ${wheres}`;
-        db.run(sql, [...Object.values(op.values || {}), ...Object.values(op.pk)]);
-        break;
-      }
-      case "DELETE": {
-        const wheres = Object.keys(op.pk).map((col) => `${col} = ?`).join(" AND ");
-        const sql = `DELETE FROM ${op.table} WHERE ${wheres}`;
-        db.run(sql, Object.values(op.pk));
-        break;
-      }
-    }
-  }
-  /**
-   * Export database as binary
-   */
-  export() {
-    return this.getDb().export();
-  }
-  /**
-   * Import database from binary
-   */
-  import(data) {
-    if (!SQL) throw new Error("SQL.js not initialized");
-    this.db?.close();
-    this.db = new SQL.Database(data);
-    this.refreshSchemas();
-  }
-  close() {
-    this.db?.close();
-    this.db = null;
-  }
-  // Schema introspection
-  refreshSchemas() {
-    this.tableSchemas.clear();
-    const db = this.getDb();
-    const tables = db.exec(
-      "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-    );
-    if (!tables[0]) return;
-    for (const row of tables[0].values) {
-      const tableName = row[0];
-      const info = db.exec(`PRAGMA table_info(${tableName})`);
-      if (info[0]) {
-        const columns = [];
-        let pkColumns = [];
-        for (const col of info[0].values) {
-          const colInfo = {
-            name: col[1],
-            type: col[2],
-            notNull: col[3] === 1,
-            defaultValue: col[4],
-            pk: col[5] > 0
-          };
-          columns.push(colInfo);
-          if (colInfo.pk) {
-            pkColumns.push(colInfo.name);
-          }
-        }
-        this.tableSchemas.set(tableName, { columns, pkColumns });
-      }
-    }
-  }
-  getTableSchema(table) {
-    if (this.tableSchemas.size === 0) {
-      this.refreshSchemas();
-    }
-    return this.tableSchemas.get(table);
-  }
-  // Operation capture helpers
-  captureInsert(sql, params, hlc) {
-    const match = sql.match(/INSERT\s+(?:OR\s+\w+\s+)?INTO\s+(\w+)/i);
-    if (!match) return null;
-    const table = match[1];
-    const schema = this.getTableSchema(table);
-    if (!schema || schema.pkColumns.length === 0) return null;
-    const colMatch = sql.match(/\(([^)]+)\)\s*VALUES/i);
-    if (!colMatch) return null;
-    const columns = colMatch[1].split(",").map((c) => c.trim());
-    const values = {};
-    const pk = {};
-    columns.forEach((col, i) => {
-      values[col] = params[i];
-      if (schema.pkColumns.includes(col)) {
-        pk[col] = params[i];
-      }
-    });
-    return { hlc, type: "INSERT", table, pk, values };
-  }
-  captureUpdate(sql, params, hlc) {
-    const match = sql.match(/UPDATE\s+(\w+)\s+SET/i);
-    if (!match) return [];
-    const table = match[1];
-    const schema = this.getTableSchema(table);
-    if (!schema || schema.pkColumns.length === 0) return [];
-    const whereMatch = sql.match(/WHERE\s+(.+)$/i);
-    const wherePart = whereMatch ? whereMatch[1] : "1=1";
-    const setMatch = sql.match(/SET\s+(.+?)\s+WHERE/i) || sql.match(/SET\s+(.+)$/i);
-    if (!setMatch) return [];
-    const setCols = setMatch[1].split(",").map((s) => s.split("=")[0].trim());
-    const setParamCount = setCols.length;
-    const whereParams = params.slice(setParamCount);
-    const selectSql = `SELECT ${schema.pkColumns.join(", ")} FROM ${table} WHERE ${wherePart}`;
-    const db = this.getDb();
-    const stmt = db.prepare(selectSql);
-    stmt.bind(whereParams);
-    const operations = [];
-    while (stmt.step()) {
-      const pkValues = stmt.get();
-      const pk = {};
-      schema.pkColumns.forEach((col, i) => {
-        pk[col] = pkValues[i];
-      });
-      const values = {};
-      setCols.forEach((col, i) => {
-        values[col] = params[i];
-      });
-      operations.push({ hlc, type: "UPDATE", table, pk, values });
-    }
-    stmt.free();
-    return operations;
-  }
-  captureDelete(sql, params, hlc) {
-    const match = sql.match(/DELETE\s+FROM\s+(\w+)/i);
-    if (!match) return [];
-    const table = match[1];
-    const schema = this.getTableSchema(table);
-    if (!schema || schema.pkColumns.length === 0) return [];
-    const whereMatch = sql.match(/WHERE\s+(.+)$/i);
-    const wherePart = whereMatch ? whereMatch[1] : "1=1";
-    const selectSql = `SELECT ${schema.pkColumns.join(", ")} FROM ${table} WHERE ${wherePart}`;
-    const db = this.getDb();
-    const stmt = db.prepare(selectSql);
-    stmt.bind(params);
-    const operations = [];
-    while (stmt.step()) {
-      const pkValues = stmt.get();
-      const pk = {};
-      schema.pkColumns.forEach((col, i) => {
-        pk[col] = pkValues[i];
-      });
-      operations.push({ hlc, type: "DELETE", table, pk });
-    }
-    stmt.free();
-    return operations;
-  }
-};
-
-// src/storage.ts
-var DB_VERSION = 1;
-var Storage = class {
-  dbName;
-  db = null;
-  constructor(dbName) {
-    this.dbName = dbName;
-  }
-  async open() {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.dbName, DB_VERSION);
-      request.onerror = () => reject(request.error);
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-        if (!db.objectStoreNames.contains("database")) {
-          db.createObjectStore("database");
-        }
-        if (!db.objectStoreNames.contains("operations")) {
-          const opStore = db.createObjectStore("operations", { keyPath: "id" });
-          opStore.createIndex("table", "table", { unique: false });
-        }
-        if (!db.objectStoreNames.contains("meta")) {
-          db.createObjectStore("meta");
-        }
-      };
-      request.onsuccess = () => {
-        this.db = request.result;
-        resolve();
-      };
-    });
+  siteId = "";
+  dbVersion = 0;
+  async open(dbName = ":memory:") {
+    const sqlite = await loadCrSqlite();
+    this.db = await sqlite.open(dbName);
+    const result = await this.db.execA("SELECT crsql_site_id()");
+    const siteIdBytes = result[0][0];
+    this.siteId = Array.from(siteIdBytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+    await this.refreshVersion();
   }
   getDb() {
     if (!this.db) throw new Error("Database not opened");
     return this.db;
   }
-  // Database file operations
-  async saveDatabase(data) {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("database", "readwrite");
-      const store = tx.objectStore("database");
-      const request = store.put(data, "main");
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
+  async refreshVersion() {
+    const result = await this.getDb().execA("SELECT crsql_db_version()");
+    this.dbVersion = Number(result[0]?.[0] ?? 0);
+  }
+  /**
+   * Execute SQL statement(s)
+   */
+  async exec(sql, params) {
+    await this.getDb().exec(sql, params);
+  }
+  /**
+   * Execute SQL and return results as objects
+   */
+  async execO(sql, params) {
+    const result = await this.getDb().execO(sql, params);
+    return result ?? [];
+  }
+  /**
+   * Execute SQL and return results as arrays
+   */
+  async execA(sql, params) {
+    const result = await this.getDb().execA(sql, params);
+    return result ?? [];
+  }
+  /**
+   * Execute SQL and return QueryResult format (for API compatibility)
+   */
+  async query(sql, params) {
+    const objRows = await this.getDb().execO(sql, params);
+    if (!objRows || objRows.length === 0) {
+      return { columns: [], rows: [] };
+    }
+    const columns = Object.keys(objRows[0]);
+    const rows = objRows.map((row) => columns.map((col) => row[col]));
+    return { columns, rows };
+  }
+  /**
+   * Enable CRDT tracking on a table
+   */
+  async enableCRR(tableName) {
+    await this.getDb().exec(`SELECT crsql_as_crr('${tableName}')`);
+  }
+  /**
+   * Get site ID as hex string
+   */
+  getSiteId() {
+    if (!this.siteId) throw new Error("Database not opened");
+    return this.siteId;
+  }
+  /**
+   * Get current database version
+   */
+  getVersion() {
+    return this.dbVersion;
+  }
+  /**
+   * Get changes since a given version
+   */
+  async getChanges(sinceVersion = 0) {
+    await this.refreshVersion();
+    const rows = await this.getDb().execO(
+      `SELECT "table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq"
+       FROM crsql_changes
+       WHERE db_version > ?`,
+      [sinceVersion]
+    );
+    return rows.map((row) => ({
+      ...row,
+      pk: uint8ToBase64(row.pk),
+      site_id: uint8ToBase64(row.site_id)
+    }));
+  }
+  /**
+   * Apply changes from another peer
+   */
+  async applyChanges(changes) {
+    const db = this.getDb();
+    for (const change of changes) {
+      const pk = base64ToUint8(change.pk);
+      const siteId = base64ToUint8(change.site_id);
+      await db.exec(
+        `INSERT INTO crsql_changes ("table", "pk", "cid", "val", "col_version", "db_version", "site_id", "cl", "seq")
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [
+          change.table,
+          pk,
+          change.cid,
+          change.val,
+          change.col_version,
+          change.db_version,
+          siteId,
+          change.cl,
+          change.seq
+        ]
+      );
+    }
+    await this.refreshVersion();
+  }
+  /**
+   * Register for update notifications
+   */
+  onUpdate(callback) {
+    return this.getDb().onUpdate((_type, _dbName, tblName, rowid) => {
+      if (!tblName.startsWith("crsql_") && !tblName.startsWith("__crsql_")) {
+        callback(tblName, rowid);
+      }
     });
   }
-  async loadDatabase() {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("database", "readonly");
-      const store = tx.objectStore("database");
-      const request = store.get("main");
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result || null);
-    });
-  }
-  // Operations log
-  async saveOperation(op) {
-    const stored = {
-      ...op,
-      id: HybridClock.toString(op.hlc)
-    };
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("operations", "readwrite");
-      const store = tx.objectStore("operations");
-      const request = store.put(stored);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
-    });
-  }
-  async getOperations(afterId) {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("operations", "readonly");
-      const store = tx.objectStore("operations");
-      const range = afterId ? IDBKeyRange.lowerBound(afterId, true) : void 0;
-      const request = store.getAll(range);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-    });
-  }
-  async getOperationCount() {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("operations", "readonly");
-      const store = tx.objectStore("operations");
-      const request = store.count();
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-    });
-  }
-  // Metadata
-  async saveMeta(key, value) {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("meta", "readwrite");
-      const store = tx.objectStore("meta");
-      const request = store.put(value, key);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve();
-    });
-  }
-  async getMeta(key) {
-    return new Promise((resolve, reject) => {
-      const tx = this.getDb().transaction("meta", "readonly");
-      const store = tx.objectStore("meta");
-      const request = store.get(key);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result ?? null);
-    });
-  }
-  close() {
-    this.db?.close();
-    this.db = null;
+  /**
+   * Close the database
+   */
+  async close() {
+    if (this.db) {
+      await this.db.exec("SELECT crsql_finalize()");
+      this.db.close();
+      this.db = null;
+    }
   }
 };
 
@@ -577,11 +295,9 @@ var WebRTCManager = class {
   peers = /* @__PURE__ */ new Map();
   iceServers;
   localPeerId;
-  signalingUrl = "";
-  token = "";
   // Callbacks
-  onOperation = null;
   onSyncRequest = null;
+  onChangesReceived = null;
   onPeerJoin = null;
   onPeerLeave = null;
   onPeerReady = null;
@@ -594,8 +310,6 @@ var WebRTCManager = class {
     this.iceServers = iceServers || DEFAULT_ICE_SERVERS;
   }
   async connect(signalingUrl, token) {
-    this.signalingUrl = signalingUrl;
-    this.token = token;
     this.signaling = new SignalingClient(signalingUrl, token, this.localPeerId);
     this.signaling.on("peers", (event) => {
       if (event.type === "peers") {
@@ -648,7 +362,7 @@ var WebRTCManager = class {
   async createPeerConnection(peerId, initiator) {
     if (this.peers.has(peerId)) return;
     const pc = new RTCPeerConnection({ iceServers: this.iceServers });
-    const peerConn = { pc, dc: null, ready: false };
+    const peerConn = { pc, dc: null, ready: false, lastSyncedVersion: 0 };
     this.peers.set(peerId, peerConn);
     pc.onicecandidate = (event) => {
       if (event.candidate) {
@@ -679,8 +393,8 @@ var WebRTCManager = class {
     dc.onopen = () => {
       peerConn.ready = true;
       this.onPeerReady?.(peerId);
-      const localVersion = this.getLocalVersion?.();
-      this.sendToPeer(peerId, { type: "sync-request", fromVersion: peerConn.lastSyncedVersion });
+      const localVersion = this.getLocalVersion?.() ?? 0;
+      this.sendToPeer(peerId, { type: "sync-request", version: localVersion });
     };
     dc.onclose = () => {
       peerConn.ready = false;
@@ -694,27 +408,33 @@ var WebRTCManager = class {
       }
     };
   }
-  handleChannelMessage(msg, fromPeerId, peerConn) {
+  async handleChannelMessage(msg, fromPeerId, peerConn) {
     switch (msg.type) {
-      case "op":
-        this.onOperation?.(msg.payload, fromPeerId);
-        if (msg.version) {
-          peerConn.lastSyncedVersion = msg.version;
+      case "sync-request": {
+        const result = await this.onSyncRequest?.(fromPeerId, msg.version);
+        if (result) {
+          this.sendToPeer(fromPeerId, {
+            type: "sync-response",
+            changes: result.changes,
+            version: result.version
+          });
         }
         break;
-      case "sync-request":
-        const ops = this.onSyncRequest?.(fromPeerId, msg.fromVersion) || [];
-        const version = this.getLocalVersion?.();
-        this.sendToPeer(fromPeerId, { type: "sync-response", operations: ops, version });
-        break;
-      case "sync-response":
-        for (const op of msg.operations) {
-          this.onOperation?.(op, fromPeerId);
+      }
+      case "sync-response": {
+        if (msg.changes.length > 0) {
+          await this.onChangesReceived?.(msg.changes, fromPeerId);
         }
-        if (msg.version) {
-          peerConn.lastSyncedVersion = msg.version;
-        }
+        peerConn.lastSyncedVersion = msg.version;
         break;
+      }
+      case "changes": {
+        if (msg.changes.length > 0) {
+          await this.onChangesReceived?.(msg.changes, fromPeerId);
+        }
+        peerConn.lastSyncedVersion = msg.version;
+        break;
+      }
       case "ping":
         this.sendToPeer(fromPeerId, { type: "pong" });
         break;
@@ -758,26 +478,14 @@ var WebRTCManager = class {
     return false;
   }
   /**
-   * Broadcast operation to all connected peers with version info
+   * Broadcast changes to all connected peers
    */
-  broadcast(op) {
-    const version = HybridClock.toString(op.hlc);
-    const message = { type: "op", payload: op, version };
+  broadcastChanges(changes, version) {
+    const message = { type: "changes", changes, version };
     for (const [peerId, peer] of this.peers) {
       if (peer.dc?.readyState === "open") {
         peer.dc.send(JSON.stringify(message));
         peer.lastSyncedVersion = version;
-      }
-    }
-  }
-  /**
-   * Request sync from all peers
-   */
-  requestSync(fromVersion) {
-    const message = { type: "sync-request", fromVersion };
-    for (const [peerId, peer] of this.peers) {
-      if (peer.dc?.readyState === "open") {
-        peer.dc.send(JSON.stringify(message));
       }
     }
   }
@@ -799,37 +507,30 @@ var WebRTCManager = class {
 // src/index.ts
 var RTCBattery = class {
   config;
-  sql;
-  storage;
-  clock;
+  db;
   webrtc = null;
   initialized = false;
   connected = false;
-  saveTimeout = null;
   eventListeners = /* @__PURE__ */ new Map();
-  // Cache for sync responses (sync callback can't be async)
-  operationsCache = [];
-  operationsCacheVersion;
+  lastBroadcastVersion = 0;
   constructor(config = {}) {
     this.config = {
       dbName: "rtc-battery-default",
       ...config
     };
-    this.sql = new SQLLayer();
-    this.storage = new Storage(this.config.dbName);
-    this.clock = new HybridClock();
+    this.db = new CRSQLiteDB();
   }
   /**
-   * Initialize the database (local only)
+   * Initialize the database
    */
   async init() {
     if (this.initialized) return;
-    await this.storage.open();
-    const existingData = await this.storage.loadDatabase();
-    await this.sql.init(existingData || void 0);
+    await this.db.open(this.config.dbName);
     this.initialized = true;
-    await this.updateOperationsCache();
-    this.scheduleSave();
+    this.db.onUpdate((table, rowid) => {
+      console.log("[RTCBattery] onUpdate fired:", table, rowid);
+      this.broadcastLocalChanges();
+    });
   }
   /**
    * Connect to signaling server and start P2P sync
@@ -844,16 +545,18 @@ var RTCBattery = class {
     if (!roomToken) {
       throw new Error("Token required. Provide in config or connect() call.");
     }
-    this.webrtc = new WebRTCManager(this.clock.getNodeId(), this.config.iceServers);
-    this.webrtc.onOperation = async (op, fromPeerId) => {
-      await this.applyRemoteOperation(op);
-      this.emit("operation", op, fromPeerId);
+    this.webrtc = new WebRTCManager(this.db.getSiteId(), this.config.iceServers);
+    this.webrtc.onSyncRequest = async (_fromPeerId, sinceVersion) => {
+      const changes = await this.db.getChanges(sinceVersion);
+      return { changes, version: this.db.getVersion() };
     };
-    this.webrtc.onSyncRequest = (fromPeerId, fromVersion) => {
-      return this.getCachedOperations(fromVersion);
+    this.webrtc.onChangesReceived = async (changes, fromPeerId) => {
+      console.log("[RTCBattery] received", changes.length, "changes from", fromPeerId);
+      await this.db.applyChanges(changes);
+      this.emit("sync", changes.length, fromPeerId);
     };
     this.webrtc.getLocalVersion = () => {
-      return this.operationsCacheVersion;
+      return this.db.getVersion();
     };
     this.webrtc.onPeerJoin = (peerId) => {
       this.emit("peer-join", peerId);
@@ -876,108 +579,53 @@ var RTCBattery = class {
     };
     await this.webrtc.connect(url, roomToken);
     this.connected = true;
+    this.lastBroadcastVersion = this.db.getVersion();
     this.emit("connected");
   }
-  getCachedOperations(fromVersion) {
-    if (!fromVersion) {
-      return this.operationsCache;
-    }
-    const index = this.operationsCache.findIndex((op) => {
-      return HybridClock.toString(op.hlc) === fromVersion;
-    });
-    if (index === -1) {
-      return this.operationsCache;
-    }
-    return this.operationsCache.slice(index + 1);
-  }
-  async updateOperationsCache() {
-    this.operationsCache = await this.storage.getOperations();
-    if (this.operationsCache.length > 0) {
-      const lastOp = this.operationsCache[this.operationsCache.length - 1];
-      this.operationsCacheVersion = HybridClock.toString(lastOp.hlc);
-    } else {
-      this.operationsCacheVersion = void 0;
+  /**
+   * Broadcast local changes to peers
+   */
+  async broadcastLocalChanges() {
+    console.log("[RTCBattery] broadcastLocalChanges called, connected:", this.connected, "webrtc:", !!this.webrtc);
+    if (!this.webrtc || !this.connected) return;
+    const changes = await this.db.getChanges(this.lastBroadcastVersion);
+    console.log("[RTCBattery] changes since version", this.lastBroadcastVersion, ":", changes.length);
+    if (changes.length > 0) {
+      const version = this.db.getVersion();
+      console.log("[RTCBattery] broadcasting", changes.length, "changes, new version:", version);
+      this.webrtc.broadcastChanges(changes, version);
+      this.lastBroadcastVersion = version;
     }
   }
   /**
    * Execute SQL query
-   * Mutations are automatically tracked as operations and synced to peers
+   * All mutations are automatically tracked by cr-sqlite and synced to peers
    */
   async exec(sql, params) {
     this.ensureInitialized();
-    const isMutation = this.isMutation(sql);
-    const hlc = isMutation ? this.clock.now() : void 0;
-    const { result, operations } = this.sql.execute(sql, params, hlc);
-    for (const op of operations) {
-      await this.storage.saveOperation(op);
-      this.emit("operation", op);
-      if (this.webrtc) {
-        this.webrtc.broadcast(op);
-      }
-    }
-    if (operations.length > 0) {
-      await this.updateOperationsCache();
-      this.scheduleSave();
-    }
-    return result;
+    return await this.db.query(sql, params);
   }
   /**
-   * Execute SQL without CRDT tracking (local only, not synced)
+   * Enable CRDT replication on a table
+   * Call this after CREATE TABLE for any table you want to sync
    */
-  async execLocal(sql, params) {
+  async enableSync(tableName) {
     this.ensureInitialized();
-    const { result } = this.sql.execute(sql, params);
-    return result;
+    await this.db.enableCRR(tableName);
   }
   /**
-   * Apply a remote operation (from another peer)
-   */
-  async applyRemoteOperation(op) {
-    this.ensureInitialized();
-    this.clock.receive(op.hlc);
-    this.sql.applyOperation(op);
-    await this.storage.saveOperation(op);
-    await this.updateOperationsCache();
-    this.scheduleSave();
-  }
-  /**
-   * Get all operations after a given HLC (for sync)
-   */
-  async getOperationsAfter(afterHlc) {
-    return this.storage.getOperations(afterHlc);
-  }
-  /**
-   * Get current operation count
-   */
-  async getOperationCount() {
-    return this.storage.getOperationCount();
-  }
-  /**
-   * Get current version (HLC string of last operation)
-   */
-  getVersion() {
-    return this.operationsCacheVersion;
-  }
-  /**
-   * Export database as binary
-   */
-  exportDatabase() {
-    this.ensureInitialized();
-    return this.sql.export();
-  }
-  /**
-   * Import database from binary
-   */
-  importDatabase(data) {
-    this.ensureInitialized();
-    this.sql.import(data);
-    this.scheduleSave();
-  }
-  /**
-   * Get local node ID
+   * Get local site ID (unique identifier for this node)
    */
   getNodeId() {
-    return this.clock.getNodeId();
+    this.ensureInitialized();
+    return this.db.getSiteId();
+  }
+  /**
+   * Get current database version
+   */
+  getVersion() {
+    this.ensureInitialized();
+    return this.db.getVersion();
   }
   /**
    * Get connected peer IDs
@@ -1026,12 +674,7 @@ var RTCBattery = class {
    */
   async close() {
     this.disconnect();
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-      await this.saveDatabase();
-    }
-    this.sql.close();
-    this.storage.close();
+    await this.db.close();
     this.initialized = false;
   }
   ensureInitialized() {
@@ -1039,28 +682,7 @@ var RTCBattery = class {
       throw new Error("RTCBattery not initialized. Call init() first.");
     }
   }
-  isMutation(sql) {
-    const normalized = sql.trim().toUpperCase();
-    return normalized.startsWith("INSERT") || normalized.startsWith("UPDATE") || normalized.startsWith("DELETE");
-  }
-  scheduleSave() {
-    if (this.saveTimeout) return;
-    this.saveTimeout = setTimeout(async () => {
-      this.saveTimeout = null;
-      await this.saveDatabase();
-    }, 1e3);
-  }
-  async saveDatabase() {
-    try {
-      const data = this.sql.export();
-      await this.storage.saveDatabase(data);
-    } catch (e) {
-      console.error("Failed to save database:", e);
-      this.emit("error", e);
-    }
-  }
 };
 export {
-  HybridClock,
   RTCBattery
 };

@@ -1,60 +1,47 @@
-import { HybridClock, HLC } from './hlc';
-import { SQLLayer } from './sql';
-import { Storage } from './storage';
+import { CRSQLiteDB } from './crsqlite';
+import type { CRChange } from './crsqlite';
 import { WebRTCManager } from './webrtc';
-import type { Operation, QueryResult, RTCBatteryConfig } from './types';
+import type { QueryResult, RTCBatteryConfig } from './types';
 
-export type { Operation, QueryResult, RTCBatteryConfig, HLC };
-export { HybridClock };
+export type { QueryResult, RTCBatteryConfig, CRChange };
 
-type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'peer-ready' | 'error' | 'operation' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected';
+type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'peer-ready' | 'error' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected';
 type EventCallback = (...args: unknown[]) => void;
 
 /**
- * RTCBattery - WebRTC + SQL + CRDT Replication
+ * RTCBattery - WebRTC + SQL + CRDT Replication (powered by cr-sqlite)
  */
 export class RTCBattery {
   private config: RTCBatteryConfig;
-  private sql: SQLLayer;
-  private storage: Storage;
-  private clock: HybridClock;
+  private db: CRSQLiteDB;
   private webrtc: WebRTCManager | null = null;
   private initialized = false;
   private connected = false;
-  private saveTimeout: ReturnType<typeof setTimeout> | null = null;
   private eventListeners: Map<EventType, Set<EventCallback>> = new Map();
-
-  // Cache for sync responses (sync callback can't be async)
-  private operationsCache: Operation[] = [];
-  private operationsCacheVersion: string | undefined;
+  private lastBroadcastVersion = 0;
 
   constructor(config: RTCBatteryConfig = {}) {
     this.config = {
       dbName: 'rtc-battery-default',
       ...config
     };
-    this.sql = new SQLLayer();
-    this.storage = new Storage(this.config.dbName!);
-    this.clock = new HybridClock();
+    this.db = new CRSQLiteDB();
   }
 
   /**
-   * Initialize the database (local only)
+   * Initialize the database
    */
   async init(): Promise<void> {
     if (this.initialized) return;
 
-    await this.storage.open();
-
-    const existingData = await this.storage.loadDatabase();
-    await this.sql.init(existingData || undefined);
-
+    await this.db.open(this.config.dbName);
     this.initialized = true;
 
-    // Load operations cache for sync
-    await this.updateOperationsCache();
-
-    this.scheduleSave();
+    // Watch for local changes to broadcast
+    this.db.onUpdate((table, rowid) => {
+      console.log('[RTCBattery] onUpdate fired:', table, rowid);
+      this.broadcastLocalChanges();
+    });
   }
 
   /**
@@ -73,22 +60,24 @@ export class RTCBattery {
       throw new Error('Token required. Provide in config or connect() call.');
     }
 
-    this.webrtc = new WebRTCManager(this.clock.getNodeId(), this.config.iceServers);
+    this.webrtc = new WebRTCManager(this.db.getSiteId(), this.config.iceServers);
 
-    // Operation handler
-    this.webrtc.onOperation = async (op, fromPeerId) => {
-      await this.applyRemoteOperation(op);
-      this.emit('operation', op, fromPeerId);
+    // Handle sync requests from peers
+    this.webrtc.onSyncRequest = async (_fromPeerId, sinceVersion) => {
+      const changes = await this.db.getChanges(sinceVersion);
+      return { changes, version: this.db.getVersion() };
     };
 
-    // Sync request handler - returns operations newer than fromVersion
-    this.webrtc.onSyncRequest = (fromPeerId, fromVersion) => {
-      return this.getCachedOperations(fromVersion);
+    // Handle incoming changes from peers
+    this.webrtc.onChangesReceived = async (changes, fromPeerId) => {
+      console.log('[RTCBattery] received', changes.length, 'changes from', fromPeerId);
+      await this.db.applyChanges(changes);
+      this.emit('sync', changes.length, fromPeerId);
     };
 
-    // Provide local version for sync protocol
+    // Provide local version for sync
     this.webrtc.getLocalVersion = () => {
-      return this.operationsCacheVersion;
+      return this.db.getVersion();
     };
 
     // Peer events
@@ -120,132 +109,59 @@ export class RTCBattery {
 
     await this.webrtc.connect(url, roomToken);
     this.connected = true;
+    this.lastBroadcastVersion = this.db.getVersion();
     this.emit('connected');
   }
 
-  private getCachedOperations(fromVersion?: string): Operation[] {
-    if (!fromVersion) {
-      return this.operationsCache;
-    }
+  /**
+   * Broadcast local changes to peers
+   */
+  private async broadcastLocalChanges(): Promise<void> {
+    console.log('[RTCBattery] broadcastLocalChanges called, connected:', this.connected, 'webrtc:', !!this.webrtc);
+    if (!this.webrtc || !this.connected) return;
 
-    // Return only operations newer than fromVersion (delta sync)
-    const index = this.operationsCache.findIndex(op => {
-      return HybridClock.toString(op.hlc) === fromVersion;
-    });
-
-    if (index === -1) {
-      // Version not found, send all
-      return this.operationsCache;
-    }
-
-    // Return operations after the found version
-    return this.operationsCache.slice(index + 1);
-  }
-
-  private async updateOperationsCache(): Promise<void> {
-    this.operationsCache = await this.storage.getOperations();
-    if (this.operationsCache.length > 0) {
-      const lastOp = this.operationsCache[this.operationsCache.length - 1];
-      this.operationsCacheVersion = HybridClock.toString(lastOp.hlc);
-    } else {
-      this.operationsCacheVersion = undefined;
+    const changes = await this.db.getChanges(this.lastBroadcastVersion);
+    console.log('[RTCBattery] changes since version', this.lastBroadcastVersion, ':', changes.length);
+    if (changes.length > 0) {
+      const version = this.db.getVersion();
+      console.log('[RTCBattery] broadcasting', changes.length, 'changes, new version:', version);
+      this.webrtc.broadcastChanges(changes, version);
+      this.lastBroadcastVersion = version;
     }
   }
 
   /**
    * Execute SQL query
-   * Mutations are automatically tracked as operations and synced to peers
+   * All mutations are automatically tracked by cr-sqlite and synced to peers
    */
   async exec(sql: string, params?: unknown[]): Promise<QueryResult> {
     this.ensureInitialized();
-
-    const isMutation = this.isMutation(sql);
-    const hlc = isMutation ? this.clock.now() : undefined;
-
-    const { result, operations } = this.sql.execute(sql, params, hlc);
-
-    for (const op of operations) {
-      await this.storage.saveOperation(op);
-      this.emit('operation', op);
-
-      if (this.webrtc) {
-        this.webrtc.broadcast(op);
-      }
-    }
-
-    if (operations.length > 0) {
-      await this.updateOperationsCache();
-      this.scheduleSave();
-    }
-
-    return result;
+    return await this.db.query(sql, params);
   }
 
   /**
-   * Execute SQL without CRDT tracking (local only, not synced)
+   * Enable CRDT replication on a table
+   * Call this after CREATE TABLE for any table you want to sync
    */
-  async execLocal(sql: string, params?: unknown[]): Promise<QueryResult> {
+  async enableSync(tableName: string): Promise<void> {
     this.ensureInitialized();
-    const { result } = this.sql.execute(sql, params);
-    return result;
+    await this.db.enableCRR(tableName);
   }
 
   /**
-   * Apply a remote operation (from another peer)
-   */
-  async applyRemoteOperation(op: Operation): Promise<void> {
-    this.ensureInitialized();
-
-    this.clock.receive(op.hlc);
-    this.sql.applyOperation(op);
-    await this.storage.saveOperation(op);
-    await this.updateOperationsCache();
-    this.scheduleSave();
-  }
-
-  /**
-   * Get all operations after a given HLC (for sync)
-   */
-  async getOperationsAfter(afterHlc?: string): Promise<Operation[]> {
-    return this.storage.getOperations(afterHlc);
-  }
-
-  /**
-   * Get current operation count
-   */
-  async getOperationCount(): Promise<number> {
-    return this.storage.getOperationCount();
-  }
-
-  /**
-   * Get current version (HLC string of last operation)
-   */
-  getVersion(): string | undefined {
-    return this.operationsCacheVersion;
-  }
-
-  /**
-   * Export database as binary
-   */
-  exportDatabase(): Uint8Array {
-    this.ensureInitialized();
-    return this.sql.export();
-  }
-
-  /**
-   * Import database from binary
-   */
-  importDatabase(data: Uint8Array): void {
-    this.ensureInitialized();
-    this.sql.import(data);
-    this.scheduleSave();
-  }
-
-  /**
-   * Get local node ID
+   * Get local site ID (unique identifier for this node)
    */
   getNodeId(): string {
-    return this.clock.getNodeId();
+    this.ensureInitialized();
+    return this.db.getSiteId();
+  }
+
+  /**
+   * Get current database version
+   */
+  getVersion(): number {
+    this.ensureInitialized();
+    return this.db.getVersion();
   }
 
   /**
@@ -301,47 +217,13 @@ export class RTCBattery {
    */
   async close(): Promise<void> {
     this.disconnect();
-
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-      await this.saveDatabase();
-    }
-    this.sql.close();
-    this.storage.close();
+    await this.db.close();
     this.initialized = false;
   }
 
   private ensureInitialized(): void {
     if (!this.initialized) {
       throw new Error('RTCBattery not initialized. Call init() first.');
-    }
-  }
-
-  private isMutation(sql: string): boolean {
-    const normalized = sql.trim().toUpperCase();
-    return (
-      normalized.startsWith('INSERT') ||
-      normalized.startsWith('UPDATE') ||
-      normalized.startsWith('DELETE')
-    );
-  }
-
-  private scheduleSave(): void {
-    if (this.saveTimeout) return;
-
-    this.saveTimeout = setTimeout(async () => {
-      this.saveTimeout = null;
-      await this.saveDatabase();
-    }, 1000);
-  }
-
-  private async saveDatabase(): Promise<void> {
-    try {
-      const data = this.sql.export();
-      await this.storage.saveDatabase(data);
-    } catch (e) {
-      console.error('Failed to save database:', e);
-      this.emit('error', e);
     }
   }
 }

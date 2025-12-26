@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RTC Battery Demo</title>
+  <title>RTC Battery Demo (cr-sqlite)</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -163,6 +163,13 @@
       margin: 10px 0;
     }
   </style>
+  <script type="importmap">
+    {
+      "imports": {
+        "@vlcn.io/crsqlite-wasm": "https://esm.sh/@vlcn.io/crsqlite-wasm@0.16.0"
+      }
+    }
+  </script>
 </head>
 <body>
   <header>
@@ -225,7 +232,7 @@
     }
 
     async function init() {
-      log('Initializing RTCBattery...', 'info');
+      log('Initializing RTCBattery with cr-sqlite...', 'info');
 
       // Get or create token from URL hash
       window.token = window.location.hash.slice(1);
@@ -257,12 +264,9 @@
           updatePeerCount();
         });
 
-        window.db.on('operation', (op, fromPeerId) => {
-          if (fromPeerId) {
-            log(`Sync: ${op.type} on ${op.table} from ${fromPeerId.slice(0, 8)}...`, 'sync');
-            // Refresh display
-            runQuery();
-          }
+        window.db.on('sync', (changeCount, fromPeerId) => {
+          log(`Synced ${changeCount} changes from ${fromPeerId.slice(0, 8)}...`, 'sync');
+          refreshTable();
         });
 
         window.db.on('connected', () => {
@@ -294,23 +298,26 @@
         log('Database initialized', 'success');
         log(`Node ID: ${window.db.getNodeId().slice(0, 8)}...`, 'info');
 
-        // Create sample table if not exists
+        // Create table and enable CRDT sync
+        // Note: cr-sqlite requires PRIMARY KEY to be NOT NULL
         await window.db.exec(`
           CREATE TABLE IF NOT EXISTS notes (
-            id TEXT PRIMARY KEY,
+            id TEXT PRIMARY KEY NOT NULL,
             content TEXT,
             created_at TEXT DEFAULT (datetime('now'))
           )
         `);
-        log('Schema ready', 'success');
+        await window.db.enableSync('notes');
+        log('Schema ready (CRDT enabled)', 'success');
 
         updateStatus('Local Only', 'syncing');
 
-        // Run initial query
-        await runQuery();
+        // Show initial data
+        await refreshTable();
 
       } catch (err) {
         log('Init error: ' + err.message, 'error');
+        console.error(err);
         updateStatus('Error', 'disconnected');
       }
     }
@@ -354,6 +361,17 @@
       }
     };
 
+    // Safe refresh - always does SELECT
+    window.refreshTable = async function() {
+      if (!window.db) return;
+      try {
+        const result = await window.db.exec('SELECT * FROM notes ORDER BY created_at DESC');
+        displayResults(result);
+      } catch (err) {
+        // Table might not exist yet
+      }
+    };
+
     window.insertSample = async function() {
       const id = crypto.randomUUID();
       const content = `Note ${Date.now()}`;
@@ -363,7 +381,7 @@
           [id, content]
         );
         log(`Inserted note: ${content}`, 'success');
-        await runQuery();
+        await refreshTable();
       } catch (err) {
         log('Insert error: ' + err.message, 'error');
       }
