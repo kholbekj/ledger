@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>RTC Battery Demo (cr-sqlite)</title>
+  <title>Ledger Demo</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -173,7 +173,7 @@
 </head>
 <body>
   <header>
-    <h1>RTC Battery Demo</h1>
+    <h1>Ledger Demo</h1>
     <span id="status" class="status disconnected">Initializing...</span>
     <div class="peers">Peers: <strong id="peer-count">0</strong></div>
   </header>
@@ -206,7 +206,7 @@
   </div>
 
   <script type="module">
-    import { RTCBattery } from './rtc-battery.js';
+    import { Ledger } from './ledger.js';
 
     window.log = function(msg, type = '') {
       const logEl = document.getElementById('log');
@@ -232,7 +232,7 @@
     }
 
     async function init() {
-      log('Initializing RTCBattery with cr-sqlite...', 'info');
+      log('Initializing Ledger...', 'info');
 
       // Get or create token from URL hash
       window.token = window.location.hash.slice(1);
@@ -244,8 +244,8 @@
       document.getElementById('share-url').value = window.location.href;
 
       try {
-        window.db = new RTCBattery({
-          dbName: `rtc-battery-${window.token}`,
+        window.db = new Ledger({
+          dbName: `ledger-${window.token}`,
           token: window.token
         });
 

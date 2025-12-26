@@ -130,7 +130,7 @@ export class WebRTCManager {
     };
 
     if (initiator) {
-      const dc = pc.createDataChannel('rtc-battery', { ordered: true });
+      const dc = pc.createDataChannel('ledger', { ordered: true });
       this.setupDataChannel(dc, peerId, peerConn);
       peerConn.dc = dc;
 

@@ -1,5 +1,5 @@
 /**
- * Simple WebSocket signaling server for RTC Battery
+ * Simple WebSocket signaling server for Ledger
  *
  * Usage: node server/signaling.js [port]
  * Default port: 8081

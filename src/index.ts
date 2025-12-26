@@ -1,18 +1,18 @@
 import { CRSQLiteDB } from './crsqlite';
 import type { CRChange } from './crsqlite';
 import { WebRTCManager } from './webrtc';
-import type { QueryResult, RTCBatteryConfig } from './types';
+import type { QueryResult, LedgerConfig } from './types';
 
-export type { QueryResult, RTCBatteryConfig, CRChange };
+export type { QueryResult, LedgerConfig, CRChange };
 
 type EventType = 'sync' | 'peer-join' | 'peer-leave' | 'peer-ready' | 'error' | 'connected' | 'disconnected' | 'reconnecting' | 'reconnected';
 type EventCallback = (...args: unknown[]) => void;
 
 /**
- * RTCBattery - WebRTC + SQL + CRDT Replication (powered by cr-sqlite)
+ * Ledger - WebRTC + SQL + CRDT Replication (powered by cr-sqlite)
  */
-export class RTCBattery {
-  private config: RTCBatteryConfig;
+export class Ledger {
+  private config: LedgerConfig;
   private db: CRSQLiteDB;
   private webrtc: WebRTCManager | null = null;
   private initialized = false;
@@ -20,9 +20,9 @@ export class RTCBattery {
   private eventListeners: Map<EventType, Set<EventCallback>> = new Map();
   private lastBroadcastVersion = 0;
 
-  constructor(config: RTCBatteryConfig = {}) {
+  constructor(config: LedgerConfig = {}) {
     this.config = {
-      dbName: 'rtc-battery-default',
+      dbName: 'ledger-default',
       ...config
     };
     this.db = new CRSQLiteDB();
@@ -38,8 +38,7 @@ export class RTCBattery {
     this.initialized = true;
 
     // Watch for local changes to broadcast
-    this.db.onUpdate((table, rowid) => {
-      console.log('[RTCBattery] onUpdate fired:', table, rowid);
+    this.db.onUpdate(() => {
       this.broadcastLocalChanges();
     });
   }
@@ -70,7 +69,6 @@ export class RTCBattery {
 
     // Handle incoming changes from peers
     this.webrtc.onChangesReceived = async (changes, fromPeerId) => {
-      console.log('[RTCBattery] received', changes.length, 'changes from', fromPeerId);
       await this.db.applyChanges(changes);
       this.emit('sync', changes.length, fromPeerId);
     };
@@ -117,14 +115,11 @@ export class RTCBattery {
    * Broadcast local changes to peers
    */
   private async broadcastLocalChanges(): Promise<void> {
-    console.log('[RTCBattery] broadcastLocalChanges called, connected:', this.connected, 'webrtc:', !!this.webrtc);
     if (!this.webrtc || !this.connected) return;
 
     const changes = await this.db.getChanges(this.lastBroadcastVersion);
-    console.log('[RTCBattery] changes since version', this.lastBroadcastVersion, ':', changes.length);
     if (changes.length > 0) {
       const version = this.db.getVersion();
-      console.log('[RTCBattery] broadcasting', changes.length, 'changes, new version:', version);
       this.webrtc.broadcastChanges(changes, version);
       this.lastBroadcastVersion = version;
     }
@@ -223,7 +218,7 @@ export class RTCBattery {
 
   private ensureInitialized(): void {
     if (!this.initialized) {
-      throw new Error('RTCBattery not initialized. Call init() first.');
+      throw new Error('Ledger not initialized. Call init() first.');
     }
   }
 }

@@ -3,7 +3,7 @@ export interface QueryResult {
   rows: unknown[][];
 }
 
-export interface RTCBatteryConfig {
+export interface LedgerConfig {
   signalingUrl?: string;
   token?: string;
   iceServers?: RTCIceServer[];

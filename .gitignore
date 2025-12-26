@@ -3,7 +3,7 @@ node_modules/
 
 # Build output
 dist/
-demo/rtc-battery.js
+demo/ledger.js
 
 # IDE
 .idea/

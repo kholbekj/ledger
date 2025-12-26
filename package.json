@@ -1,15 +1,15 @@
 {
-  "name": "rtc-battery",
+  "name": "ledger",
   "version": "0.2.0",
   "description": "WebRTC + SQL + CRDT replication library (powered by cr-sqlite)",
   "type": "module",
-  "main": "dist/rtc-battery.js",
+  "main": "dist/ledger.js",
   "types": "dist/index.d.ts",
   "scripts": {
-    "build": "esbuild src/index.ts --bundle --outfile=dist/rtc-battery.js --format=esm --external:@vlcn.io/crsqlite-wasm",
-    "build:demo": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser --external:@vlcn.io/crsqlite-wasm",
-    "dev": "esbuild src/index.ts --bundle --outfile=demo/rtc-battery.js --format=esm --platform=browser --external:@vlcn.io/crsqlite-wasm --watch --servedir=demo",
-    "signal": "node server/signaling.js",
+    "build": "esbuild src/index.ts --bundle --outfile=dist/ledger.js --format=esm --external:@vlcn.io/crsqlite-wasm",
+    "build:demo": "esbuild src/index.ts --bundle --outfile=demo/ledger.js --format=esm --platform=browser --external:@vlcn.io/crsqlite-wasm",
+    "dev": "esbuild src/index.ts --bundle --outfile=demo/ledger.js --format=esm --platform=browser --external:@vlcn.io/crsqlite-wasm --watch --servedir=demo",
+    "server": "node server/signaling.js",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "typecheck": "tsc --noEmit"
   },
