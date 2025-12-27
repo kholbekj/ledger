@@ -185,7 +185,7 @@
   </div>
 
   <div class="connect-bar">
-    <input type="text" id="signaling-url" placeholder="ws://localhost:8081" value="ws://localhost:8081">
+    <input type="text" id="signaling-url" placeholder="wss://drifting.ink/ws/signal" value="wss://drifting.ink/ws/signal">
     <button id="connect-btn" onclick="toggleConnect()">Connect</button>
   </div>
 
@@ -314,6 +314,17 @@
 
         // Show initial data
         await refreshTable();
+
+        // Auto-connect to signaling server
+        const signalingUrl = document.getElementById('signaling-url').value.trim();
+        if (signalingUrl) {
+          log('Auto-connecting to signaling...', 'info');
+          try {
+            await window.db.connect(signalingUrl, window.token);
+          } catch (err) {
+            log('Auto-connect failed: ' + err.message, 'error');
+          }
+        }
 
       } catch (err) {
         log('Init error: ' + err.message, 'error');
